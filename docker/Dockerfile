@@ -58,4 +58,7 @@ ENV STICKY_COOKIES_REFRESH=""
 
 EXPOSE 8080
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -qO- http://localhost:${OVERSEER_PORT}/ws 2>&1 | grep -q "400 Bad Request" || exit 1
+
 CMD ["sticky-overseer", "-command", "sticky-recorder"]
