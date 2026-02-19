@@ -34,6 +34,7 @@ COPY --from=builder /out/bin/ /usr/local/bin/
 ENV OVERSEER_PORT=8080
 ENV OVERSEER_TRUSTED_CIDRS=""
 ENV OVERSEER_LOG_FILE=/data/overseer.jsonl
+ENV OVERSEER_DB=""
 
 # sticky-recorder
 ENV STICKY_OUT=/data/recordings/{{.Driver}}/{{.Source}}/{{.Session.Year}}-{{.Session.Month}}-{{.Session.Day}}_{{.Session.Hour}}-{{.Session.Minute}}-{{.Session.Second}}/{{.Recording.Year}}-{{.Recording.Month}}-{{.Recording.Day}}_{{.Recording.Hour}}-{{.Recording.Minute}}-{{.Recording.Second}}

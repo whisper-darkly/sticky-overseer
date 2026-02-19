@@ -22,8 +22,8 @@ type Task struct {
 
 type Hub struct {
 	mu            sync.RWMutex
-	clients       map[*websocket.Conn]struct{}
-	tasks         map[string]*Task // task_id → Task
+	clients       map[*websocket.Conn]*sync.Mutex // conn → per-conn write lock
+	tasks         map[string]*Task                // task_id → Task
 	db            *sql.DB
 	pinnedCommand string
 	eventLog      *json.Encoder
@@ -31,7 +31,7 @@ type Hub struct {
 
 func NewHub(db *sql.DB) *Hub {
 	h := &Hub{
-		clients: make(map[*websocket.Conn]struct{}),
+		clients: make(map[*websocket.Conn]*sync.Mutex),
 		tasks:   make(map[string]*Task),
 		db:      db,
 	}
@@ -66,7 +66,7 @@ func (h *Hub) logEvent(v interface{}) {
 
 func (h *Hub) AddClient(conn *websocket.Conn) {
 	h.mu.Lock()
-	h.clients[conn] = struct{}{}
+	h.clients[conn] = &sync.Mutex{}
 	h.mu.Unlock()
 }
 
@@ -83,10 +83,12 @@ func (h *Hub) Broadcast(msg interface{}) {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for conn := range h.clients {
+	for conn, mu := range h.clients {
+		mu.Lock()
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 			log.Printf("write error: %v", err)
 		}
+		mu.Unlock()
 	}
 }
 
@@ -105,7 +107,7 @@ func (h *Hub) HandleClient(conn *websocket.Conn) {
 
 		var msg IncomingMessage
 		if err := json.Unmarshal(raw, &msg); err != nil {
-			sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "invalid JSON"})
+			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "invalid JSON"})
 			continue
 		}
 
@@ -121,7 +123,7 @@ func (h *Hub) HandleClient(conn *websocket.Conn) {
 		case "replay":
 			h.handleReplay(conn, msg)
 		default:
-			sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "unknown message type"})
+			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "unknown message type"})
 		}
 	}
 }
@@ -130,13 +132,13 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 	command := msg.Command
 	if h.pinnedCommand != "" {
 		if command != "" && command != h.pinnedCommand {
-			sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: fmt.Sprintf("command must be %q (pinned)", h.pinnedCommand)})
+			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: fmt.Sprintf("command must be %q (pinned)", h.pinnedCommand)})
 			return
 		}
 		command = h.pinnedCommand
 	}
 	if command == "" {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "command is required"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "command is required"})
 		return
 	}
 	args := msg.Args
@@ -165,7 +167,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 		if h.db != nil {
 			if err := createTask(h.db, rec); err != nil {
 				h.mu.Unlock()
-				sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "db error: " + err.Error()})
+				h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "db error: " + err.Error()})
 				return
 			}
 		}
@@ -182,7 +184,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 		running := task.worker.State == "running"
 		task.worker.mu.Unlock()
 		if running {
-			sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task already has a running worker"})
+			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task already has a running worker"})
 			return
 		}
 	}
@@ -190,7 +192,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 	task.record.State = "active"
 	w, err := StartWorker(h, WorkerConfig{TaskID: taskID, Command: command, Args: args})
 	if err != nil {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
 		return
 	}
 	task.worker = w
@@ -204,7 +206,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 
 	log.Printf("started worker task=%s pid=%d cmd=%s", taskID, w.PID, command)
 	started := StartedMessage{Type: "started", ID: msg.ID, TaskID: taskID, PID: w.PID, TS: w.StartedAt}
-	sendJSON(conn, started)
+	h.sendJSON(conn, started)
 	h.logEvent(started)
 }
 
@@ -213,7 +215,7 @@ func (h *Hub) handleList(conn *websocket.Conn, msg IncomingMessage) {
 	if msg.Since != "" {
 		t, err := time.Parse(time.RFC3339, msg.Since)
 		if err != nil {
-			sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "invalid since timestamp"})
+			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "invalid since timestamp"})
 			return
 		}
 		since = &t
@@ -241,19 +243,19 @@ func (h *Hub) handleList(conn *websocket.Conn, msg IncomingMessage) {
 	if infos == nil {
 		infos = []TaskInfo{}
 	}
-	sendJSON(conn, TasksMessage{Type: "tasks", ID: msg.ID, Tasks: infos})
+	h.sendJSON(conn, TasksMessage{Type: "tasks", ID: msg.ID, Tasks: infos})
 }
 
 func (h *Hub) handleStop(conn *websocket.Conn, msg IncomingMessage) {
 	if msg.TaskID == "" {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task_id is required"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task_id is required"})
 		return
 	}
 	h.mu.RLock()
 	task, ok := h.tasks[msg.TaskID]
 	h.mu.RUnlock()
 	if !ok {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task not found"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task not found"})
 		return
 	}
 
@@ -278,14 +280,14 @@ func (h *Hub) handleStop(conn *websocket.Conn, msg IncomingMessage) {
 
 func (h *Hub) handleReset(conn *websocket.Conn, msg IncomingMessage) {
 	if msg.TaskID == "" {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task_id is required"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task_id is required"})
 		return
 	}
 	h.mu.RLock()
 	task, ok := h.tasks[msg.TaskID]
 	h.mu.RUnlock()
 	if !ok {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task not found"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task not found"})
 		return
 	}
 
@@ -293,7 +295,7 @@ func (h *Hub) handleReset(conn *websocket.Conn, msg IncomingMessage) {
 	defer task.mu.Unlock()
 
 	if task.record.State != "errored" {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task is not in errored state"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task is not in errored state"})
 		return
 	}
 
@@ -307,7 +309,7 @@ func (h *Hub) handleReset(conn *websocket.Conn, msg IncomingMessage) {
 
 	w, err := StartWorker(h, WorkerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
 	if err != nil {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
 		return
 	}
 	task.worker = w
@@ -320,20 +322,20 @@ func (h *Hub) handleReset(conn *websocket.Conn, msg IncomingMessage) {
 
 	log.Printf("reset task=%s, started pid=%d", msg.TaskID, w.PID)
 	started := StartedMessage{Type: "started", ID: msg.ID, TaskID: msg.TaskID, PID: w.PID, TS: w.StartedAt}
-	sendJSON(conn, started)
+	h.sendJSON(conn, started)
 	h.logEvent(started)
 }
 
 func (h *Hub) handleReplay(conn *websocket.Conn, msg IncomingMessage) {
 	if msg.TaskID == "" {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task_id is required"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task_id is required"})
 		return
 	}
 	h.mu.RLock()
 	task, ok := h.tasks[msg.TaskID]
 	h.mu.RUnlock()
 	if !ok {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task not found"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task not found"})
 		return
 	}
 
@@ -342,7 +344,7 @@ func (h *Hub) handleReplay(conn *websocket.Conn, msg IncomingMessage) {
 	task.mu.Unlock()
 
 	if w == nil {
-		sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "no worker for task"})
+		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "no worker for task"})
 		return
 	}
 
@@ -350,7 +352,7 @@ func (h *Hub) handleReplay(conn *websocket.Conn, msg IncomingMessage) {
 	if msg.Since != "" {
 		t, err := time.Parse(time.RFC3339, msg.Since)
 		if err != nil {
-			sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "invalid since timestamp"})
+			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "invalid since timestamp"})
 			return
 		}
 		since = &t
@@ -360,13 +362,13 @@ func (h *Hub) handleReplay(conn *websocket.Conn, msg IncomingMessage) {
 	for _, evt := range events {
 		switch evt.Type {
 		case "output":
-			sendJSON(conn, OutputMessage{Type: "output", TaskID: evt.TaskID, PID: evt.PID, Stream: evt.Stream, Data: evt.Data, TS: evt.TS})
+			h.sendJSON(conn, OutputMessage{Type: "output", TaskID: evt.TaskID, PID: evt.PID, Stream: evt.Stream, Data: evt.Data, TS: evt.TS})
 		case "exited":
 			ec := 0
 			if evt.ExitCode != nil {
 				ec = *evt.ExitCode
 			}
-			sendJSON(conn, ExitedMessage{Type: "exited", TaskID: evt.TaskID, PID: evt.PID, ExitCode: ec, Intentional: evt.Intentional, TS: evt.TS})
+			h.sendJSON(conn, ExitedMessage{Type: "exited", TaskID: evt.TaskID, PID: evt.PID, ExitCode: ec, Intentional: evt.Intentional, TS: evt.TS})
 		}
 	}
 }
@@ -520,10 +522,18 @@ func newUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-func sendJSON(conn *websocket.Conn, v interface{}) {
+func (h *Hub) sendJSON(conn *websocket.Conn, v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
+	h.mu.RLock()
+	mu := h.clients[conn]
+	h.mu.RUnlock()
+	if mu == nil {
+		return
+	}
+	mu.Lock()
 	conn.WriteMessage(websocket.TextMessage, data)
+	mu.Unlock()
 }
