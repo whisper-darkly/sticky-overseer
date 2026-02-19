@@ -5,10 +5,10 @@
 .PHONY: build export load clean help version
 
 IMAGE_NAME            := sticky-overseer
-VERSION               ?= $(shell cat VERSION)
+REPO_ROOT             := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
+VERSION               ?= $(shell cat $(REPO_ROOT)/VERSION)
 DIST_DIR              := dist
 EXPORT_FILE           := $(DIST_DIR)/$(IMAGE_NAME)-$(VERSION).tar
-REPO_ROOT             := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 STICKY_RECORDER_REF   ?=
 STICKY_RECORDER_REPO  ?=
 
