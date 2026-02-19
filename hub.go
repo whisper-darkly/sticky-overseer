@@ -72,10 +72,19 @@ func NewHub(cfg HubConfig) *Hub {
 	return h
 }
 
+// Hubber is the interface implemented by *Hub. Consumers that need mock-ability
+// (tests, embedded services) can accept Hubber instead of the concrete *Hub.
+type Hubber interface {
+	AddClient(conn *websocket.Conn)
+	RemoveClient(conn *websocket.Conn)
+	Broadcast(msg any)
+	HandleClient(conn *websocket.Conn)
+}
+
 // NewHandler returns an http.HandlerFunc that upgrades HTTP to WebSocket,
 // enforces IP trust, and delegates to hub.HandleClient.
 // Pass nil trustedNets to allow connections from any IP.
-func NewHandler(h *Hub, trustedNets []*net.IPNet) http.HandlerFunc {
+func NewHandler(h Hubber, trustedNets []*net.IPNet) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !isTrusted(r, trustedNets) {
 			http.Error(w, "forbidden", http.StatusForbidden)

@@ -3,17 +3,35 @@ package overseer
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
+
+// Task state constants. Use these instead of bare strings when filtering or
+// setting TaskRecord.State.
+const (
+	StateActive  = "active"
+	StateStopped = "stopped"
+	StateErrored = "errored"
+)
+
+// schemaVersion is incremented whenever a breaking schema change is made.
+// OpenDB returns ErrSchemaMismatch if the on-disk version is older.
+const schemaVersion = 1
+
+// ErrSchemaMismatch is returned by OpenDB when the database was created by an
+// older (or newer) version of the library and needs migration.
+var ErrSchemaMismatch = errors.New("overseer: database schema version mismatch — manual migration required")
 
 type TaskRecord struct {
 	TaskID        string
 	Command       string
 	Args          []string
 	RetryPolicy   *RetryPolicy
-	State         string // "active", "stopped", "errored"
+	State         string // see StateActive / StateStopped / StateErrored
 	RestartCount  int
 	ExitCount     int
 	CreatedAt     time.Time
@@ -22,12 +40,55 @@ type TaskRecord struct {
 	ErrorMessage  string
 }
 
+// OpenDB opens (or creates) the SQLite database at path and applies the schema.
+// Pass ":memory:" for an in-memory database (useful in tests).
+//
+// WAL journal mode and a 5 s busy timeout are always enabled so that multiple
+// processes sharing the same file do not deadlock under concurrent load.
 func OpenDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
+
+	// Enable WAL mode and a busy timeout before touching any application tables.
+	// These pragmas are idempotent and safe to run on every open.
+	for _, pragma := range []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA busy_timeout=5000`,
+	} {
+		if _, err := db.Exec(pragma); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("overseer: failed to set pragma %q: %w", pragma, err)
+		}
+	}
+
+	// Schema version table — created once, never mutated.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (
+		version INTEGER NOT NULL
+	)`); err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	var ver int
+	err = db.QueryRow(`SELECT version FROM schema_version LIMIT 1`).Scan(&ver)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// Fresh database — write the current version.
+		if _, err := db.Exec(`INSERT INTO schema_version (version) VALUES (?)`, schemaVersion); err != nil {
+			db.Close()
+			return nil, err
+		}
+	case err != nil:
+		db.Close()
+		return nil, err
+	case ver != schemaVersion:
+		db.Close()
+		return nil, fmt.Errorf("%w: on-disk version %d, library version %d", ErrSchemaMismatch, ver, schemaVersion)
+	}
+
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
 		task_id         TEXT PRIMARY KEY,
 		command         TEXT NOT NULL,
 		args            TEXT NOT NULL,
@@ -39,10 +100,11 @@ func OpenDB(path string) (*sql.DB, error) {
 		last_started_at TEXT,
 		last_exited_at  TEXT,
 		error_message   TEXT
-	)`)
-	if err != nil {
+	)`); err != nil {
+		db.Close()
 		return nil, err
 	}
+
 	return db, nil
 }
 
