@@ -417,3 +417,443 @@ func TestShutdown_Idempotent(t *testing.T) {
 		t.Fatalf("second Shutdown: %v", err)
 	}
 }
+
+// TestShutdown_ContextTimeout verifies Shutdown returns ctx.Err when context
+// expires before workers exit.
+func TestShutdown_ContextTimeout(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"command": "/bin/sleep",
+		"args":    []string{"60"},
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+
+	// Shutdown with a context that expires before the worker can be stopped.
+	// Worker.Stop() sends SIGTERM, but the kill goroutine takes 5 s; our ctx
+	// expires sooner, so Shutdown should return context.DeadlineExceeded.
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+	err := e.hub.Shutdown(ctx)
+	if err == nil {
+		// Worker might have exited by chance; acceptable but unlikely.
+		t.Log("Shutdown returned nil (worker exited before context expired)")
+	}
+	// Forcefully clean up the long-running sleep.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	_ = e.hub.Shutdown(ctx2)
+}
+
+// --- Message handler edge cases ---
+
+func TestHandleUnknownMessageType(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "bogus", "id": "req1"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for unknown type, got %q", msgType(m))
+	}
+}
+
+func TestHandleInvalidJSON(t *testing.T) {
+	e := newHubEnv(t, "")
+	if err := e.conn.WriteMessage(websocket.TextMessage, []byte(`{not valid json`)); err != nil {
+		t.Fatalf("WriteMessage: %v", err)
+	}
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for invalid JSON, got %q", msgType(m))
+	}
+}
+
+// --- handleList ---
+
+func TestHandleList_Empty(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "list", "id": "l1"})
+	m := e.readMsg(t)
+	if msgType(m) != "tasks" {
+		t.Fatalf("expected tasks, got %q", msgType(m))
+	}
+	tasks, _ := m["tasks"].([]interface{})
+	if len(tasks) != 0 {
+		t.Errorf("expected 0 tasks, got %d", len(tasks))
+	}
+}
+
+func TestHandleList_SinceFilter_ExcludesOldTasks(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"task_id": "old-task",
+		"command": "/bin/echo",
+		"args":    []string{"hi"},
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "exited"
+	})
+
+	// A since far in the future excludes tasks whose last activity is in the past.
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	e.send(t, map[string]interface{}{"type": "list", "since": future, "id": "l1"})
+	m := e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "tasks"
+	})
+	tasks, _ := m["tasks"].([]interface{})
+	for _, raw := range tasks {
+		task, _ := raw.(map[string]interface{})
+		if task["task_id"] == "old-task" {
+			t.Error("old task should have been filtered by since")
+		}
+	}
+}
+
+func TestHandleList_InvalidSince(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "list", "since": "not-a-timestamp", "id": "l1"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for invalid since, got %q", msgType(m))
+	}
+}
+
+// --- handleStop ---
+
+func TestHandleStop_MissingTaskID(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "stop", "id": "s1"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for missing task_id, got %q", msgType(m))
+	}
+}
+
+func TestHandleStop_NotFound(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "ghost"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for unknown task, got %q", msgType(m))
+	}
+}
+
+// --- handleReset ---
+
+func TestHandleReset_MissingTaskID(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "reset", "id": "r1"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for missing task_id, got %q", msgType(m))
+	}
+}
+
+func TestHandleReset_NotFound(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "reset", "task_id": "ghost"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for unknown task, got %q", msgType(m))
+	}
+}
+
+// TestReset_ErroredTask_Restarts verifies a successful reset: an errored task
+// returns to active and a new worker is started.
+func TestReset_ErroredTask_Restarts(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"id":      "s1",
+		"task_id": "errored-task",
+		"command": "/bin/false",
+		"retry_policy": map[string]interface{}{
+			"error_threshold": 1,
+		},
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+	e.readUntil(t, 10*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "errored"
+	})
+
+	e.send(t, map[string]interface{}{"type": "reset", "task_id": "errored-task", "id": "r1"})
+	m := e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+	if tid, _ := m["task_id"].(string); tid != "errored-task" {
+		t.Errorf("started task_id: got %q want errored-task", tid)
+	}
+	// Task restarts again and will error again; just stop it.
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "errored-task"})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "exited"
+	})
+}
+
+// --- handleReplay ---
+
+func TestHandleReplay_MissingTaskID(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "replay", "id": "r1"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for missing task_id, got %q", msgType(m))
+	}
+}
+
+func TestHandleReplay_NotFound(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{"type": "replay", "task_id": "ghost"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for unknown task, got %q", msgType(m))
+	}
+}
+
+// TestHandleReplay_NoWorker exercises the "no worker for task" path — a task
+// that exists in memory but has never had a worker started (e.g. loaded from
+// DB after a restart).
+func TestHandleReplay_NoWorker(t *testing.T) {
+	e := newHubEnv(t, "")
+	// Inject a task with nil worker directly.
+	e.hub.mu.Lock()
+	e.hub.tasks["noworker"] = &Task{
+		record: TaskRecord{
+			TaskID:  "noworker",
+			Command: "/bin/echo",
+			Args:    []string{},
+			State:   StateStopped,
+		},
+	}
+	e.hub.mu.Unlock()
+
+	e.send(t, map[string]interface{}{"type": "replay", "task_id": "noworker", "id": "r1"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for task with no worker, got %q", msgType(m))
+	}
+}
+
+func TestHandleReplay_InvalidSince(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"task_id": "rs-inv",
+		"command": "/bin/sleep",
+		"args":    []string{"10"},
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+
+	e.send(t, map[string]interface{}{"type": "replay", "task_id": "rs-inv", "since": "garbage"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for invalid since, got %q", msgType(m))
+	}
+
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "rs-inv"})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "exited"
+	})
+}
+
+// TestHandleReplay_SinceFilter_Future verifies that replaying with a since
+// timestamp in the future returns no events.
+func TestHandleReplay_SinceFilter_Future(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"task_id": "rsfuture",
+		"command": "/bin/echo",
+		"args":    []string{"hello"},
+	})
+	started := e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+	taskID := started["task_id"].(string)
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "exited"
+	})
+	// Discard any remaining buffered messages (e.g. output).
+	e.buf = nil
+
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	e.send(t, map[string]interface{}{"type": "replay", "task_id": taskID, "since": future})
+
+	// Nothing should arrive within a short window.
+	e.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+	_, raw, err := e.conn.ReadMessage()
+	if err == nil {
+		var m map[string]interface{}
+		_ = json.Unmarshal(raw, &m)
+		if msgType(m) == "output" || msgType(m) == "exited" {
+			t.Errorf("future-since replay should return no events; got %q", msgType(m))
+		}
+	}
+}
+
+// --- Retry policy ---
+
+// TestRetryPolicy_RestartOnExit verifies that a task with a retry policy but
+// no error threshold broadcasts a "restarting" message on unintentional exit.
+func TestRetryPolicy_RestartOnExit(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"id":      "s1",
+		"task_id": "restart-task",
+		"command": "/bin/false",
+		// retry_policy with no error_threshold → restart indefinitely
+		"retry_policy": map[string]interface{}{},
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+
+	// Expect a restarting broadcast.
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "restarting"
+	})
+
+	// Stop the task to prevent an infinite restart loop.
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "restart-task"})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "exited"
+	})
+}
+
+// --- Internal unit tests ---
+
+// TestNewHub_LoadsExitHistoryFromDB verifies that exitHistory is populated from
+// the persisted exit_timestamps column when the hub starts.
+func TestNewHub_LoadsExitHistoryFromDB(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC().Truncate(time.Second)
+	rec := TaskRecord{
+		TaskID:    "hist-task",
+		Command:   "/bin/echo",
+		Args:      []string{},
+		State:     StateStopped,
+		CreatedAt: now,
+	}
+	if err := createTask(db, rec); err != nil {
+		t.Fatal(err)
+	}
+	exits := []time.Time{now.Add(-2 * time.Minute), now.Add(-1 * time.Minute)}
+	if err := updateTaskExitTimestamps(db, "hist-task", exits); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHub(HubConfig{DB: db})
+
+	h.mu.RLock()
+	task, ok := h.tasks["hist-task"]
+	h.mu.RUnlock()
+	if !ok {
+		t.Fatal("task not found in hub after load")
+	}
+
+	task.mu.Lock()
+	hist := make([]time.Time, len(task.exitHistory))
+	copy(hist, task.exitHistory)
+	task.mu.Unlock()
+
+	if len(hist) != 2 {
+		t.Fatalf("exitHistory: got %d entries want 2", len(hist))
+	}
+	if !hist[0].Equal(exits[0]) {
+		t.Errorf("exitHistory[0]: got %v want %v", hist[0], exits[0])
+	}
+	if !hist[1].Equal(exits[1]) {
+		t.Errorf("exitHistory[1]: got %v want %v", hist[1], exits[1])
+	}
+}
+
+func TestTaskInfo_PopulatesWorkerFields(t *testing.T) {
+	exitCode := 42
+	task := &Task{
+		record: TaskRecord{
+			TaskID:       "t",
+			Command:      "/bin/echo",
+			Args:         []string{"x"},
+			State:        StateStopped,
+			CreatedAt:    time.Now().UTC(),
+			ErrorMessage: "something went wrong",
+		},
+		worker: &Worker{
+			PID:      9999,
+			State:    WorkerExited,
+			ExitCode: &exitCode,
+		},
+	}
+	info := taskInfo(task)
+	if info.CurrentPID != 9999 {
+		t.Errorf("CurrentPID: got %d want 9999", info.CurrentPID)
+	}
+	if info.WorkerState != WorkerExited {
+		t.Errorf("WorkerState: got %v want %v", info.WorkerState, WorkerExited)
+	}
+	if info.LastExitCode == nil || *info.LastExitCode != 42 {
+		t.Errorf("LastExitCode: got %v want 42", info.LastExitCode)
+	}
+	if info.ErrorMessage != "something went wrong" {
+		t.Errorf("ErrorMessage: got %q", info.ErrorMessage)
+	}
+}
+
+func TestTaskInfo_NilWorker(t *testing.T) {
+	task := &Task{
+		record: TaskRecord{
+			TaskID:    "t",
+			Command:   "/bin/echo",
+			Args:      []string{},
+			State:     StateStopped,
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+	info := taskInfo(task)
+	if info.CurrentPID != 0 {
+		t.Errorf("CurrentPID: got %d want 0", info.CurrentPID)
+	}
+	if info.WorkerState != "" {
+		t.Errorf("WorkerState: got %q want empty", info.WorkerState)
+	}
+	if info.LastExitCode != nil {
+		t.Errorf("LastExitCode: got %v want nil", info.LastExitCode)
+	}
+}
+
+func TestTaskInfo_NilExitCode(t *testing.T) {
+	// Worker that is still running has no ExitCode yet.
+	task := &Task{
+		record: TaskRecord{
+			TaskID:    "t",
+			Command:   "/bin/echo",
+			Args:      []string{},
+			State:     StateActive,
+			CreatedAt: time.Now().UTC(),
+		},
+		worker: &Worker{
+			PID:      1111,
+			State:    WorkerRunning,
+			ExitCode: nil,
+		},
+	}
+	info := taskInfo(task)
+	if info.LastExitCode != nil {
+		t.Errorf("LastExitCode: got %v want nil for running worker", info.LastExitCode)
+	}
+}

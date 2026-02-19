@@ -101,3 +101,37 @@ func TestLastEventAt_NonEmpty(t *testing.T) {
 		t.Errorf("lastEventAt: got %v want %v", *got, t2)
 	}
 }
+
+// TestGetEvents_SinceAfterAll verifies that a since timestamp after all events
+// returns an empty slice.
+func TestGetEvents_SinceAfterAll(t *testing.T) {
+	w := newTestWorker()
+	base := time.Now().UTC()
+	w.addEvent(Event{Type: "output", TS: base})
+	w.addEvent(Event{Type: "output", TS: base.Add(time.Second)})
+
+	since := base.Add(time.Hour)
+	events := w.getEvents(&since)
+	if len(events) != 0 {
+		t.Errorf("expected 0 events after all timestamps, got %d", len(events))
+	}
+}
+
+// TestStop_AlreadyExited verifies that calling Stop on a worker in the Exited
+// state is a safe no-op.
+func TestStop_AlreadyExited(t *testing.T) {
+	w := &Worker{State: WorkerExited}
+	w.Stop() // must not panic
+}
+
+// TestStartWorker_BadCommand verifies that startWorker returns an error when
+// the executable does not exist.
+func TestStartWorker_BadCommand(t *testing.T) {
+	_, err := startWorker(
+		workerConfig{TaskID: "t", Command: "/nonexistent/binary/xyz"},
+		workerCallbacks{},
+	)
+	if err == nil {
+		t.Error("expected error for non-existent command")
+	}
+}

@@ -122,6 +122,46 @@ func TestRetryPolicy_MarshalOmitsZeroDurations(t *testing.T) {
 	}
 }
 
+func TestIsTrusted_IPv6Loopback(t *testing.T) {
+	nets := DetectLocalSubnets()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "[::1]:9000"
+	if !isTrusted(req, nets) {
+		t.Error("[::1] should be trusted by DetectLocalSubnets")
+	}
+}
+
+func TestIsTrusted_MalformedAddr(t *testing.T) {
+	nets := DetectLocalSubnets()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "notanaddr"
+	if isTrusted(req, nets) {
+		t.Error("malformed RemoteAddr should not be trusted")
+	}
+}
+
+func TestRestartingMessage_MarshalJSON(t *testing.T) {
+	msg := RestartingMessage{
+		Type:         "restarting",
+		TaskID:       "t1",
+		PID:          42,
+		RestartDelay: 30 * time.Second,
+		Attempt:      1,
+		TS:           time.Now().UTC(),
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got, ok := m["restart_delay"].(string); !ok || got != "30s" {
+		t.Errorf("restart_delay: got %v (%T), want \"30s\"", m["restart_delay"], m["restart_delay"])
+	}
+}
+
 func TestParseTrustedCIDRs_Empty(t *testing.T) {
 	nets, err := ParseTrustedCIDRs("")
 	if err != nil {

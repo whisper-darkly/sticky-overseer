@@ -337,6 +337,62 @@ func TestExitTimestamps_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestGetTask_NotFound(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	got, err := getTask(db, "does-not-exist")
+	if err == nil {
+		t.Errorf("expected error for missing task, got record: %+v", got)
+	}
+	if got != nil {
+		t.Errorf("expected nil record for missing task")
+	}
+}
+
+func TestListTasks_Empty(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tasks, err := listTasks(db)
+	if err != nil {
+		t.Fatalf("listTasks on empty DB: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("expected 0 tasks, got %d", len(tasks))
+	}
+}
+
+func TestEncodeTimestamps_Empty(t *testing.T) {
+	if got := encodeTimestamps(nil); got != "[]" {
+		t.Errorf("encodeTimestamps(nil) = %q, want \"[]\"", got)
+	}
+	if got := encodeTimestamps([]time.Time{}); got != "[]" {
+		t.Errorf("encodeTimestamps([]) = %q, want \"[]\"", got)
+	}
+}
+
+func TestDecodeTimestamps_Malformed(t *testing.T) {
+	if got := decodeTimestamps("not-json"); got != nil {
+		t.Errorf("expected nil for malformed JSON, got %v", got)
+	}
+}
+
+func TestDecodeTimestamps_InvalidTimestamp(t *testing.T) {
+	// Valid JSON array but the second entry is not a valid RFC3339Nano timestamp.
+	input := `["2024-01-01T00:00:00Z","not-a-timestamp","2024-06-01T00:00:00Z"]`
+	got := decodeTimestamps(input)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 valid timestamps (invalid entry skipped), got %d", len(got))
+	}
+}
+
 func TestOpenDB_SchemaMismatch_V1(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
