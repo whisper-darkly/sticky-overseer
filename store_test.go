@@ -5,16 +5,6 @@ import (
 	"time"
 )
 
-func openTestDB(t *testing.T) interface{ Close() error } {
-	t.Helper()
-	db, err := OpenDB(":memory:")
-	if err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
-
 func TestOpenDB_Idempotent(t *testing.T) {
 	db, err := OpenDB(":memory:")
 	if err != nil {

@@ -41,6 +41,7 @@ type Hub struct {
 	db            *sql.DB
 	pinnedCommand string
 	eventLog      *json.Encoder
+	eventLogMu    sync.Mutex // serialises concurrent Encode calls on eventLog
 }
 
 // NewHub creates a Hub, loads persisted tasks from DB, and marks them stopped.
@@ -172,9 +173,9 @@ func (h *Hub) logEvent(v interface{}) {
 	if h.eventLog == nil {
 		return
 	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.eventLogMu.Lock()
 	_ = h.eventLog.Encode(v)
+	h.eventLogMu.Unlock()
 }
 
 // AddClient registers a WebSocket connection with the hub.
