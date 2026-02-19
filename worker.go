@@ -17,6 +17,14 @@ type workerConfig struct {
 	Args    []string
 }
 
+// workerCallbacks are injected into each worker at start time, decoupling
+// Worker from Hub and enabling isolated unit testing.
+type workerCallbacks struct {
+	onOutput func(msg OutputMessage)
+	logEvent func(v any)
+	onExited func(w *Worker, exitCode int, intentional bool, t time.Time)
+}
+
 type Worker struct {
 	PID       int
 	TaskID    string
@@ -30,7 +38,7 @@ type Worker struct {
 	cmd             *exec.Cmd
 	mu              sync.Mutex
 	events          []Event
-	hub             *Hub
+	callbacks       workerCallbacks
 	intentionalStop bool
 }
 
@@ -70,7 +78,7 @@ func (w *Worker) lastEventAt() *time.Time {
 	return &t
 }
 
-func startWorker(hub *Hub, cfg workerConfig) (*Worker, error) {
+func startWorker(cfg workerConfig, cb workerCallbacks) (*Worker, error) {
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -93,7 +101,7 @@ func startWorker(hub *Hub, cfg workerConfig) (*Worker, error) {
 		State:     WorkerRunning,
 		StartedAt: time.Now().UTC(),
 		cmd:       cmd,
-		hub:       hub,
+		callbacks: cb,
 	}
 
 	var wg sync.WaitGroup
@@ -107,8 +115,8 @@ func startWorker(hub *Hub, cfg workerConfig) (*Worker, error) {
 			evt := Event{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
 			w.addEvent(evt)
 			msg := OutputMessage{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
-			hub.Broadcast(msg)
-			hub.logEvent(msg)
+			w.callbacks.onOutput(msg)
+			w.callbacks.logEvent(msg)
 		}
 	}
 
@@ -137,7 +145,7 @@ func startWorker(hub *Hub, cfg workerConfig) (*Worker, error) {
 		evt := Event{Type: "exited", TaskID: w.TaskID, PID: w.PID, ExitCode: &exitCode, Intentional: intentional, TS: now}
 		w.addEvent(evt)
 		log.Printf("worker task=%s pid=%d exited code=%d intentional=%v", w.TaskID, w.PID, exitCode, intentional)
-		hub.onWorkerExited(w, exitCode, intentional, now)
+		w.callbacks.onExited(w, exitCode, intentional, now)
 	}()
 
 	return w, nil

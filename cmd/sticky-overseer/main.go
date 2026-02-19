@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	overseer "github.com/whisper-darkly/sticky-overseer"
 	_ "modernc.org/sqlite"
@@ -93,6 +97,29 @@ func main() {
 	}
 
 	http.Handle("/ws", overseer.NewHandler(hub, nets))
-	log.Printf("overseer listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	srv := &http.Server{Addr: ":" + port}
+
+	go func() {
+		log.Printf("overseer listening on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	log.Printf("received %v, shutting down", sig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
+	}
+	if err := hub.Shutdown(ctx); err != nil {
+		log.Printf("hub shutdown: %v", err)
+	}
+	log.Println("shutdown complete")
 }

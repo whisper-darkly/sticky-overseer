@@ -1,6 +1,7 @@
 package overseer
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -378,4 +379,41 @@ func TestPinnedCommand_OmittedCommand(t *testing.T) {
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
+}
+
+// TestShutdown_StopsRunningWorkers verifies Shutdown stops all running workers.
+func TestShutdown_StopsRunningWorkers(t *testing.T) {
+	e := newHubEnv(t, "")
+	e.send(t, map[string]interface{}{
+		"type":    "start",
+		"id":      "s1",
+		"command": "/bin/sleep",
+		"args":    []string{"60"},
+	})
+	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
+		return msgType(m) == "started"
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := e.hub.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	// After shutdown, no running workers should remain.
+	if e.hub.hasRunningWorkers() {
+		t.Error("expected no running workers after Shutdown")
+	}
+}
+
+// TestShutdown_Idempotent verifies calling Shutdown twice doesn't panic.
+func TestShutdown_Idempotent(t *testing.T) {
+	e := newHubEnv(t, "")
+	ctx := context.Background()
+	if err := e.hub.Shutdown(ctx); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	if err := e.hub.Shutdown(ctx); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
 }

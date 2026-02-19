@@ -1,6 +1,7 @@
 package overseer
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -43,15 +44,18 @@ type Hub struct {
 	pinnedCommand string
 	eventLog      *json.Encoder
 	eventLogMu    sync.Mutex // serialises concurrent Encode calls on eventLog
+	shutdownCh    chan struct{}
+	shutdownOnce  sync.Once
 }
 
 // NewHub creates a Hub, loads persisted tasks from DB, and marks them stopped.
 func NewHub(cfg HubConfig) *Hub {
 	h := &Hub{
-		clients:       make(map[*websocket.Conn]*sync.Mutex),
-		tasks:         make(map[string]*Task),
-		db:            cfg.DB,
+		clients:    make(map[*websocket.Conn]*sync.Mutex),
+		tasks:      make(map[string]*Task),
+		db:         cfg.DB,
 		pinnedCommand: cfg.PinnedCommand,
+		shutdownCh: make(chan struct{}),
 	}
 	if cfg.EventLog != nil {
 		h.eventLog = json.NewEncoder(cfg.EventLog)
@@ -83,6 +87,64 @@ type Hubber interface {
 	RemoveClient(conn *websocket.Conn)
 	Broadcast(msg any)
 	HandleClient(conn *websocket.Conn)
+	Shutdown(ctx context.Context) error
+}
+
+// compile-time check that *Hub satisfies Hubber.
+var _ Hubber = (*Hub)(nil)
+
+// Shutdown signals all pending restarts to abort, stops every running worker,
+// and waits for them to exit or ctx to expire.
+func (h *Hub) Shutdown(ctx context.Context) error {
+	h.shutdownOnce.Do(func() { close(h.shutdownCh) })
+
+	// Collect running workers under locks, then call Stop() with no locks held.
+	var workers []*Worker
+	h.mu.RLock()
+	for _, task := range h.tasks {
+		task.mu.Lock()
+		if task.worker != nil {
+			task.worker.mu.Lock()
+			if task.worker.State == WorkerRunning {
+				workers = append(workers, task.worker)
+			}
+			task.worker.mu.Unlock()
+		}
+		task.mu.Unlock()
+	}
+	h.mu.RUnlock()
+
+	for _, w := range workers {
+		w.Stop()
+	}
+
+	// Poll until all workers have exited or context expires.
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+			if !h.hasRunningWorkers() {
+				return nil
+			}
+		}
+	}
+}
+
+func (h *Hub) hasRunningWorkers() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, task := range h.tasks {
+		task.mu.Lock()
+		running := task.worker != nil && task.worker.State == WorkerRunning
+		task.mu.Unlock()
+		if running {
+			return true
+		}
+	}
+	return false
 }
 
 // NewHandler returns an http.HandlerFunc that upgrades HTTP to WebSocket,
@@ -206,19 +268,26 @@ func (h *Hub) RemoveClient(conn *websocket.Conn) {
 }
 
 // Broadcast serialises msg to JSON and writes it to every connected client.
+// Dead connections are removed after the broadcast pass.
 func (h *Hub) Broadcast(msg interface{}) {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return
 	}
+	var dead []*websocket.Conn
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	for conn, mu := range h.clients {
 		mu.Lock()
 		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			log.Printf("write error: %v", err)
+			log.Printf("broadcast write error: %v", err)
+			dead = append(dead, conn)
 		}
 		mu.Unlock()
+	}
+	h.mu.RUnlock()
+	for _, c := range dead {
+		h.RemoveClient(c)
+		c.Close()
 	}
 }
 
@@ -256,6 +325,16 @@ func (h *Hub) HandleClient(conn *websocket.Conn) {
 		default:
 			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "unknown message type"})
 		}
+	}
+}
+
+func (h *Hub) workerCB() workerCallbacks {
+	return workerCallbacks{
+		onOutput: func(msg OutputMessage) { h.Broadcast(msg) },
+		logEvent: func(v any) { h.logEvent(v) },
+		onExited: func(w *Worker, code int, intentional bool, t time.Time) {
+			h.onWorkerExited(w, code, intentional, t)
+		},
 	}
 }
 
@@ -320,7 +399,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 	}
 
 	task.record.State = StateActive
-	w, err := startWorker(h, workerConfig{TaskID: taskID, Command: command, Args: args})
+	w, err := startWorker(workerConfig{TaskID: taskID, Command: command, Args: args}, h.workerCB())
 	if err != nil {
 		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
 		return
@@ -438,7 +517,7 @@ func (h *Hub) handleReset(conn *websocket.Conn, msg IncomingMessage) {
 		_ = updateTaskExitTimestamps(h.db, msg.TaskID, nil)
 	}
 
-	w, err := startWorker(h, workerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
+	w, err := startWorker(workerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args}, h.workerCB())
 	if err != nil {
 		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
 		return
@@ -504,7 +583,7 @@ func (h *Hub) handleReplay(conn *websocket.Conn, msg IncomingMessage) {
 	}
 }
 
-// onWorkerExited is called by the worker goroutine when the process exits.
+// onWorkerExited is called by the worker callbacks when the process exits.
 func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time.Time) {
 	exited := ExitedMessage{Type: "exited", TaskID: w.TaskID, PID: w.PID, ExitCode: exitCode, Intentional: intentional, TS: now}
 	h.Broadcast(exited)
@@ -578,7 +657,11 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 
 func (h *Hub) doRestart(task *Task, oldPID int, attempt int, delay time.Duration) {
 	if delay > 0 {
-		time.Sleep(delay)
+		select {
+		case <-time.After(delay):
+		case <-h.shutdownCh:
+			return
+		}
 	}
 
 	task.mu.Lock()
@@ -589,7 +672,7 @@ func (h *Hub) doRestart(task *Task, oldPID int, attempt int, delay time.Duration
 		return
 	}
 
-	w, err := startWorker(h, workerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
+	w, err := startWorker(workerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args}, h.workerCB())
 	if err != nil {
 		log.Printf("task=%s restart failed: %v", task.record.TaskID, err)
 		return
@@ -651,11 +734,10 @@ func (h *Hub) sendJSON(conn *websocket.Conn, v interface{}) {
 	}
 	h.mu.RLock()
 	mu := h.clients[conn]
-	h.mu.RUnlock()
-	if mu == nil {
-		return
+	if mu != nil {
+		mu.Lock()
+		conn.WriteMessage(websocket.TextMessage, data)
+		mu.Unlock()
 	}
-	mu.Lock()
-	conn.WriteMessage(websocket.TextMessage, data)
-	mu.Unlock()
+	h.mu.RUnlock()
 }
