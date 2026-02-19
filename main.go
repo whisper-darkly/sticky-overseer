@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/gorilla/websocket"
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -24,6 +25,7 @@ var (
 
 func main() {
 	pinnedCmd := flag.String("command", "", "Pin the allowed command (clients cannot override)")
+	dbPath := flag.String("db", "", "SQLite database path (default: $OVERSEER_DB or ./overseer.db)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	showHelp := flag.Bool("help", false, "Print usage and exit")
 	flag.Parse()
@@ -39,6 +41,7 @@ func main() {
 		fmt.Println("  OVERSEER_PORT           Listen port (default: 8080)")
 		fmt.Println("  OVERSEER_TRUSTED_CIDRS  Comma-separated IPs/CIDRs (default: auto-detect local)")
 		fmt.Println("  OVERSEER_LOG_FILE       Optional JSONL event log path")
+		fmt.Println("  OVERSEER_DB             SQLite database path (default: ./overseer.db)")
 		os.Exit(0)
 	}
 
@@ -53,7 +56,22 @@ func main() {
 	}
 
 	trustedNets := parseTrustedCIDRs()
-	hub := NewHub()
+
+	resolvedDBPath := *dbPath
+	if resolvedDBPath == "" {
+		resolvedDBPath = os.Getenv("OVERSEER_DB")
+	}
+	if resolvedDBPath == "" {
+		resolvedDBPath = "./overseer.db"
+	}
+	db, err := openDB(resolvedDBPath)
+	if err != nil {
+		log.Fatalf("failed to open database %s: %v", resolvedDBPath, err)
+	}
+	defer db.Close()
+	log.Printf("database: %s", resolvedDBPath)
+
+	hub := NewHub(db)
 
 	if logPath := os.Getenv("OVERSEER_LOG_FILE"); logPath != "" {
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)

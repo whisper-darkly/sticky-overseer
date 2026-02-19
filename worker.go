@@ -11,8 +11,15 @@ import (
 
 const ringBufferSize = 100
 
+type WorkerConfig struct {
+	TaskID  string
+	Command string
+	Args    []string
+}
+
 type Worker struct {
 	PID       int
+	TaskID    string
 	Command   string
 	Args      []string
 	State     string // "running" or "exited"
@@ -20,10 +27,11 @@ type Worker struct {
 	ExitedAt  *time.Time
 	ExitCode  *int
 
-	cmd    *exec.Cmd
-	mu     sync.Mutex
-	events []Event
-	hub    *Hub
+	cmd            *exec.Cmd
+	mu             sync.Mutex
+	events         []Event
+	hub            *Hub
+	intentionalStop bool
 }
 
 func (w *Worker) addEvent(e Event) {
@@ -62,25 +70,8 @@ func (w *Worker) lastEventAt() *time.Time {
 	return &t
 }
 
-func (w *Worker) Info() WorkerInfo {
-	info := WorkerInfo{
-		PID:         w.PID,
-		Command:     w.Command,
-		Args:        w.Args,
-		State:       w.State,
-		StartedAt:   w.StartedAt,
-		ExitedAt:    w.ExitedAt,
-		ExitCode:    w.ExitCode,
-		LastEventAt: w.lastEventAt(),
-	}
-	if info.Args == nil {
-		info.Args = []string{}
-	}
-	return info
-}
-
-func StartWorker(hub *Hub, command string, args []string) (*Worker, error) {
-	cmd := exec.Command(command, args...)
+func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
+	cmd := exec.Command(cfg.Command, cfg.Args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -96,8 +87,9 @@ func StartWorker(hub *Hub, command string, args []string) (*Worker, error) {
 
 	w := &Worker{
 		PID:       cmd.Process.Pid,
-		Command:   command,
-		Args:      args,
+		TaskID:    cfg.TaskID,
+		Command:   cfg.Command,
+		Args:      cfg.Args,
 		State:     "running",
 		StartedAt: time.Now().UTC(),
 		cmd:       cmd,
@@ -112,9 +104,9 @@ func StartWorker(hub *Hub, command string, args []string) (*Worker, error) {
 		for scanner.Scan() {
 			now := time.Now().UTC()
 			line := scanner.Text()
-			evt := Event{Type: "output", PID: w.PID, Stream: stream, Data: line, TS: now}
+			evt := Event{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
 			w.addEvent(evt)
-			msg := OutputMessage{Type: "output", PID: w.PID, Stream: stream, Data: line, TS: now}
+			msg := OutputMessage{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
 			hub.Broadcast(msg)
 			hub.logEvent(msg)
 		}
@@ -139,27 +131,34 @@ func StartWorker(hub *Hub, command string, args []string) (*Worker, error) {
 		w.State = "exited"
 		w.ExitedAt = &now
 		w.ExitCode = &exitCode
+		intentional := w.intentionalStop
 		w.mu.Unlock()
 
-		evt := Event{Type: "exited", PID: w.PID, ExitCode: &exitCode, TS: now}
+		evt := Event{Type: "exited", TaskID: w.TaskID, PID: w.PID, ExitCode: &exitCode, Intentional: intentional, TS: now}
 		w.addEvent(evt)
-		exited := ExitedMessage{Type: "exited", PID: w.PID, ExitCode: exitCode, TS: now}
-		hub.Broadcast(exited)
-		hub.logEvent(exited)
-		log.Printf("worker pid=%d exited code=%d", w.PID, exitCode)
+		log.Printf("worker task=%s pid=%d exited code=%d intentional=%v", w.TaskID, w.PID, exitCode, intentional)
+		hub.onWorkerExited(w, exitCode, intentional, now)
 	}()
 
 	return w, nil
 }
 
 func (w *Worker) Stop() {
+	w.mu.Lock()
 	if w.State != "running" || w.cmd.Process == nil {
+		w.mu.Unlock()
 		return
 	}
+	w.intentionalStop = true
+	w.mu.Unlock()
+
 	_ = w.cmd.Process.Signal(syscall.SIGTERM)
 	go func() {
 		time.Sleep(5 * time.Second)
-		if w.State == "running" {
+		w.mu.Lock()
+		running := w.State == "running"
+		w.mu.Unlock()
+		if running {
 			_ = w.cmd.Process.Kill()
 		}
 	}()
