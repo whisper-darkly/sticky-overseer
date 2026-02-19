@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"crypto/rand"
@@ -6,18 +6,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// HubConfig holds all options for creating a Hub.
+type HubConfig struct {
+	DB            *sql.DB       // required; use OpenDB() to create
+	PinnedCommand string        // optional; restricts start commands
+	EventLog      *json.Encoder // optional; JSONL event log writer
+}
+
 // Task is the in-memory representation of a persistent task.
 type Task struct {
 	mu          sync.Mutex
 	record      TaskRecord
-	worker      *Worker      // current running worker, nil if not running
-	exitHistory []time.Time  // non-intentional exits for threshold tracking (not persisted)
+	worker      *Worker     // current running worker, nil if not running
+	exitHistory []time.Time // non-intentional exits for threshold tracking (not persisted)
 }
 
 type Hub struct {
@@ -29,15 +43,17 @@ type Hub struct {
 	eventLog      *json.Encoder
 }
 
-func NewHub(db *sql.DB) *Hub {
+// NewHub creates a Hub, loads persisted tasks from DB, and marks them stopped.
+func NewHub(cfg HubConfig) *Hub {
 	h := &Hub{
-		clients: make(map[*websocket.Conn]*sync.Mutex),
-		tasks:   make(map[string]*Task),
-		db:      db,
+		clients:       make(map[*websocket.Conn]*sync.Mutex),
+		tasks:         make(map[string]*Task),
+		db:            cfg.DB,
+		pinnedCommand: cfg.PinnedCommand,
+		eventLog:      cfg.EventLog,
 	}
-	// Load persisted tasks; mark them all stopped (no auto-restart on overseer restart).
-	if db != nil {
-		records, err := listTasks(db)
+	if cfg.DB != nil {
+		records, err := listTasks(cfg.DB)
 		if err != nil {
 			log.Printf("warn: failed to load tasks from db: %v", err)
 		} else {
@@ -45,7 +61,7 @@ func NewHub(db *sql.DB) *Hub {
 				r := r
 				if r.State == "active" {
 					r.State = "stopped"
-					_ = updateTaskState(db, r.TaskID, "stopped", "")
+					_ = updateTaskState(cfg.DB, r.TaskID, "stopped", "")
 				}
 				h.tasks[r.TaskID] = &Task{record: r}
 			}
@@ -53,6 +69,103 @@ func NewHub(db *sql.DB) *Hub {
 		}
 	}
 	return h
+}
+
+// NewHandler returns an http.HandlerFunc that upgrades HTTP to WebSocket,
+// enforces IP trust, and delegates to hub.HandleClient.
+// Pass nil trustedNets to allow connections from any IP.
+func NewHandler(h *Hub, trustedNets []*net.IPNet) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isTrusted(r, trustedNets) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("upgrade error: %v", err)
+			return
+		}
+		log.Printf("client connected from %s", r.RemoteAddr)
+		h.HandleClient(conn)
+		log.Printf("client disconnected from %s", r.RemoteAddr)
+	}
+}
+
+// ParseTrustedCIDRs parses a comma-separated list of bare IPs and CIDR ranges.
+// Returns nil, nil for an empty string; callers interpret nil as "allow all".
+func ParseTrustedCIDRs(s string) ([]*net.IPNet, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var nets []*net.IPNet
+	for _, cidr := range strings.Split(s, ",") {
+		cidr = strings.TrimSpace(cidr)
+		if !strings.Contains(cidr, "/") {
+			ip := net.ParseIP(cidr)
+			if ip == nil {
+				return nil, fmt.Errorf("invalid IP in trusted CIDRs: %s", cidr)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			_, ipnet, _ := net.ParseCIDR(fmt.Sprintf("%s/%d", cidr, bits))
+			nets = append(nets, ipnet)
+		} else {
+			_, ipnet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR in trusted CIDRs: %s", cidr)
+			}
+			nets = append(nets, ipnet)
+		}
+	}
+	return nets, nil
+}
+
+// DetectLocalSubnets returns loopback (127.0.0.0/8, ::1/128) plus all
+// subnets found on local network interfaces.
+func DetectLocalSubnets() []*net.IPNet {
+	var nets []*net.IPNet
+	_, lo4, _ := net.ParseCIDR("127.0.0.0/8")
+	_, lo6, _ := net.ParseCIDR("::1/128")
+	nets = append(nets, lo4, lo6)
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nets
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				nets = append(nets, ipnet)
+			}
+		}
+	}
+	return nets
+}
+
+func isTrusted(r *http.Request, nets []*net.IPNet) bool {
+	if len(nets) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	for _, n := range nets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) logEvent(v interface{}) {
@@ -64,18 +177,21 @@ func (h *Hub) logEvent(v interface{}) {
 	_ = h.eventLog.Encode(v)
 }
 
+// AddClient registers a WebSocket connection with the hub.
 func (h *Hub) AddClient(conn *websocket.Conn) {
 	h.mu.Lock()
 	h.clients[conn] = &sync.Mutex{}
 	h.mu.Unlock()
 }
 
+// RemoveClient deregisters a WebSocket connection.
 func (h *Hub) RemoveClient(conn *websocket.Conn) {
 	h.mu.Lock()
 	delete(h.clients, conn)
 	h.mu.Unlock()
 }
 
+// Broadcast serialises msg to JSON and writes it to every connected client.
 func (h *Hub) Broadcast(msg interface{}) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -92,6 +208,7 @@ func (h *Hub) Broadcast(msg interface{}) {
 	}
 }
 
+// HandleClient runs the read loop for conn until the connection closes.
 func (h *Hub) HandleClient(conn *websocket.Conn) {
 	h.AddClient(conn)
 	defer func() {
@@ -146,7 +263,6 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 		args = []string{}
 	}
 
-	// Resolve or create task.
 	taskID := msg.TaskID
 	if taskID == "" {
 		taskID = newUUID()
@@ -400,11 +516,9 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 
 	rp := task.record.RetryPolicy
 	if rp == nil {
-		// No retry policy — stay active, client manages restarts.
 		return
 	}
 
-	// Prune exit history to error window.
 	if rp.ErrorWindow != "" {
 		window, err := parseDuration(rp.ErrorWindow)
 		if err == nil {
@@ -435,7 +549,6 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 		return
 	}
 
-	// Schedule restart.
 	restartDelay := 0 * time.Second
 	if rp.RestartDelay != "" {
 		if d, err := parseDuration(rp.RestartDelay); err == nil {
@@ -517,8 +630,8 @@ func parseDuration(s string) (time.Duration, error) {
 func newUUID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 

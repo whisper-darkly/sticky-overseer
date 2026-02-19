@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"testing"
@@ -7,7 +7,7 @@ import (
 
 func openTestDB(t *testing.T) interface{ Close() error } {
 	t.Helper()
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatalf("openDB: %v", err)
 	}
@@ -16,7 +16,7 @@ func openTestDB(t *testing.T) interface{ Close() error } {
 }
 
 func TestOpenDB_Idempotent(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatalf("first openDB: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestOpenDB_Idempotent(t *testing.T) {
 }
 
 func TestCreateGetTask_RoundTrip(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestCreateGetTask_RoundTrip(t *testing.T) {
 }
 
 func TestCreateGetTask_WithRetryPolicy(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestCreateGetTask_WithRetryPolicy(t *testing.T) {
 }
 
 func TestListTasks_OrderAndMultipleRows(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestListTasks_OrderAndMultipleRows(t *testing.T) {
 }
 
 func TestUpdateTaskState(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestUpdateTaskState(t *testing.T) {
 }
 
 func TestUpdateTaskStats(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestUpdateTaskStats(t *testing.T) {
 }
 
 func TestDeleteTask(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestDeleteTask(t *testing.T) {
 }
 
 func TestScanTaskRow_NullOptionalFields(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}

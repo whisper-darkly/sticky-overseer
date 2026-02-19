@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"net/http"
@@ -7,7 +7,7 @@ import (
 )
 
 func TestIsTrusted_Loopback(t *testing.T) {
-	nets := detectLocalSubnets()
+	nets := DetectLocalSubnets()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "127.0.0.1:9000"
 	if !isTrusted(req, nets) {
@@ -16,9 +16,8 @@ func TestIsTrusted_Loopback(t *testing.T) {
 }
 
 func TestIsTrusted_OutOfRange(t *testing.T) {
-	nets := detectLocalSubnets()
+	nets := DetectLocalSubnets()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	// Use a public IP unlikely to be in any local subnet
 	req.RemoteAddr = "203.0.113.1:9000" // TEST-NET-3 (RFC 5737)
 	if isTrusted(req, nets) {
 		t.Error("203.0.113.1 should not be trusted by local subnets")
@@ -35,7 +34,6 @@ func TestIsTrusted_EmptyNets_AllowAll(t *testing.T) {
 
 func TestNewUUID_Format(t *testing.T) {
 	uuid := newUUID()
-	// Format: 8-4-4-4-12
 	parts := splitDash(uuid)
 	if len(parts) != 5 {
 		t.Fatalf("expected 5 dash-separated parts, got %d: %q", len(parts), uuid)
@@ -87,6 +85,33 @@ func TestParseDuration_Invalid(t *testing.T) {
 		if err == nil {
 			t.Errorf("parseDuration(%q): expected error but got none", s)
 		}
+	}
+}
+
+func TestParseTrustedCIDRs_Empty(t *testing.T) {
+	nets, err := ParseTrustedCIDRs("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nets != nil {
+		t.Error("expected nil nets for empty string")
+	}
+}
+
+func TestParseTrustedCIDRs_Valid(t *testing.T) {
+	nets, err := ParseTrustedCIDRs("127.0.0.1,10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(nets) != 2 {
+		t.Fatalf("expected 2 nets, got %d", len(nets))
+	}
+}
+
+func TestParseTrustedCIDRs_Invalid(t *testing.T) {
+	_, err := ParseTrustedCIDRs("not-an-ip")
+	if err == nil {
+		t.Error("expected error for invalid IP")
 	}
 }
 

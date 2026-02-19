@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"encoding/json"
@@ -22,14 +22,13 @@ type hubTestEnv struct {
 
 func newHubEnv(t *testing.T, pinnedCmd string) *hubTestEnv {
 	t.Helper()
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
-		t.Fatalf("openDB: %v", err)
+		t.Fatalf("OpenDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 
-	hub := NewHub(db)
-	hub.pinnedCommand = pinnedCmd
+	hub := NewHub(HubConfig{DB: db, PinnedCommand: pinnedCmd})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}

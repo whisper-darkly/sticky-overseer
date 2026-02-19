@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"database/sql"
@@ -22,7 +22,7 @@ type TaskRecord struct {
 	ErrorMessage  string
 }
 
-func openDB(path string) (*sql.DB, error) {
+func OpenDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
