@@ -1,0 +1,38 @@
+services:
+  overseer:
+    image: sticky-overseer:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      # sticky-overseer
+      OVERSEER_PORT: 8080
+      # OVERSEER_TRUSTED_CIDRS: 10.0.0.0/8
+      OVERSEER_LOG_FILE: /data/overseer.jsonl
+
+      # sticky-recorder — core
+      STICKY_OUT: "/data/recordings/{{.Driver}}/{{.Source}}/{{.Session.Year}}-{{.Session.Month}}-{{.Session.Day}}_{{.Session.Hour}}-{{.Session.Minute}}-{{.Session.Second}}/{{.Recording.Year}}-{{.Recording.Month}}-{{.Recording.Day}}_{{.Recording.Hour}}-{{.Recording.Minute}}-{{.Recording.Second}}"
+      STICKY_DRIVER: chaturbate          # chaturbate | stripchat
+      STICKY_RESOLUTION: 720
+      STICKY_FRAMERATE: 30
+      STICKY_SEGMENT_LENGTH: ""          # e.g. 1h — 0/empty disables splitting
+      STICKY_CHECK_INTERVAL: 1m          # poll interval when source is offline
+      STICKY_RETRY_DELAY: 5s
+      STICKY_SEGMENT_TIMEOUT: 5m
+      STICKY_RECORDING_TIMEOUT: 30m
+
+      # sticky-recorder — output
+      STICKY_OUTPUT_FORMAT: json
+      STICKY_LOG_LEVEL: error            # debug | info | warn | error | fatal
+      STICKY_LOG: ""                     # e.g. /data/recorder.jsonl
+      STICKY_EXEC_FATAL: ""              # set to 1 to treat non-zero --exec exit as fatal
+
+      # sticky-recorder — auth
+      STICKY_COOKIES: ""                 # literal cookie string, file://, or https:// URL
+      STICKY_USER_AGENT: ""
+      STICKY_EXTERNAL_COOKIES: ""        # set to 1 to enable file:// and https:// cookie sources
+      STICKY_COOKIES_SAFE_DOMAINS: ""    # comma-separated safe domains/CIDRs for URL sources
+      STICKY_COOKIES_JSON: ""            # set to 1 to parse external cookie source as JSON array
+      STICKY_COOKIES_REFRESH: ""         # e.g. 5m
