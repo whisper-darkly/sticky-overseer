@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Docker smoke test for sticky-overseer.
-# Builds Dockerfile.base (generic, no sticky-recorder dependency) and runs
-# a simple WebSocket round-trip using /bin/sh as the pinned command.
+# Builds docker/Dockerfile and runs a simple WebSocket round-trip
+# using /bin/sh as the pinned command.
 #
 # Usage: bash docker/test.sh
 # Requires: docker, and either websocat or python3 with websockets package.
@@ -20,7 +20,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> Building image ${IMAGE} (Dockerfile.base)..."
-docker build -f docker/Dockerfile.base -t "${IMAGE}" .
+docker build -f docker/Dockerfile -t "${IMAGE}" .
 
 echo "==> Starting container ${CONTAINER} (pinned to /bin/sh)..."
 docker run -d --rm \
