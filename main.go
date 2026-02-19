@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -53,6 +54,16 @@ func main() {
 
 	trustedNets := parseTrustedCIDRs()
 	hub := NewHub()
+
+	if logPath := os.Getenv("OVERSEER_LOG_FILE"); logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("failed to open log file %s: %v", logPath, err)
+		}
+		defer f.Close()
+		hub.eventLog = json.NewEncoder(f)
+		log.Printf("event log: %s", logPath)
+	}
 	hub.pinnedCommand = *pinnedCmd
 	if *pinnedCmd != "" {
 		log.Printf("command pinned to: %s", *pinnedCmd)

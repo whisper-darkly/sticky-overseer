@@ -15,6 +15,7 @@ type Hub struct {
 	clients       map[*websocket.Conn]bool
 	workers       map[int]*Worker
 	pinnedCommand string
+	eventLog      *json.Encoder
 }
 
 func NewHub() *Hub {
@@ -22,6 +23,15 @@ func NewHub() *Hub {
 		clients: make(map[*websocket.Conn]bool),
 		workers: make(map[int]*Worker),
 	}
+}
+
+func (h *Hub) logEvent(v interface{}) {
+	if h.eventLog == nil {
+		return
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_ = h.eventLog.Encode(v)
 }
 
 func (h *Hub) AddClient(conn *websocket.Conn) {
@@ -110,7 +120,9 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 	h.workers[w.PID] = w
 	h.mu.Unlock()
 	log.Printf("started worker pid=%d cmd=%s", w.PID, msg.Command)
-	sendJSON(conn, StartedMessage{Type: "started", ID: msg.ID, PID: w.PID, TS: w.StartedAt})
+	started := StartedMessage{Type: "started", ID: msg.ID, PID: w.PID, TS: w.StartedAt}
+	sendJSON(conn, started)
+	h.logEvent(started)
 }
 
 func (h *Hub) handleList(conn *websocket.Conn, msg IncomingMessage) {

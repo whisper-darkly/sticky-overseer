@@ -114,7 +114,9 @@ func StartWorker(hub *Hub, command string, args []string) (*Worker, error) {
 			line := scanner.Text()
 			evt := Event{Type: "output", PID: w.PID, Stream: stream, Data: line, TS: now}
 			w.addEvent(evt)
-			hub.Broadcast(OutputMessage{Type: "output", PID: w.PID, Stream: stream, Data: line, TS: now})
+			msg := OutputMessage{Type: "output", PID: w.PID, Stream: stream, Data: line, TS: now}
+			hub.Broadcast(msg)
+			hub.logEvent(msg)
 		}
 	}
 
@@ -141,7 +143,9 @@ func StartWorker(hub *Hub, command string, args []string) (*Worker, error) {
 
 		evt := Event{Type: "exited", PID: w.PID, ExitCode: &exitCode, TS: now}
 		w.addEvent(evt)
-		hub.Broadcast(ExitedMessage{Type: "exited", PID: w.PID, ExitCode: exitCode, TS: now})
+		exited := ExitedMessage{Type: "exited", PID: w.PID, ExitCode: exitCode, TS: now}
+		hub.Broadcast(exited)
+		hub.logEvent(exited)
 		log.Printf("worker pid=%d exited code=%d", w.PID, exitCode)
 	}()
 
