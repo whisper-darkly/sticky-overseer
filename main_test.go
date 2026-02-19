@@ -1,9 +1,11 @@
 package overseer
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestIsTrusted_Loopback(t *testing.T) {
@@ -57,34 +59,66 @@ func TestNewUUID_NoCollisions(t *testing.T) {
 	}
 }
 
-func TestParseDuration_Valid(t *testing.T) {
-	cases := []struct {
-		s    string
-		want string
-	}{
-		{"30s", "30s"},
-		{"5m", "5m0s"},
-		{"1h30m", "1h30m0s"},
+func TestRetryPolicy_JSONRoundTrip(t *testing.T) {
+	rp := RetryPolicy{
+		RestartDelay:   30 * time.Second,
+		ErrorWindow:    5 * time.Minute,
+		ErrorThreshold: 3,
 	}
-	for _, c := range cases {
-		d, err := parseDuration(c.s)
-		if err != nil {
-			t.Errorf("parseDuration(%q): unexpected error: %v", c.s, err)
-			continue
-		}
-		if d.String() != c.want {
-			t.Errorf("parseDuration(%q): got %q want %q", c.s, d.String(), c.want)
-		}
+	b, err := json.Marshal(rp)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	var got RetryPolicy
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("UnmarshalJSON: %v", err)
+	}
+	if got.RestartDelay != 30*time.Second {
+		t.Errorf("RestartDelay: got %v want 30s", got.RestartDelay)
+	}
+	if got.ErrorWindow != 5*time.Minute {
+		t.Errorf("ErrorWindow: got %v want 5m", got.ErrorWindow)
+	}
+	if got.ErrorThreshold != 3 {
+		t.Errorf("ErrorThreshold: got %d want 3", got.ErrorThreshold)
 	}
 }
 
-func TestParseDuration_Invalid(t *testing.T) {
-	cases := []string{"", "abc", "1d", "5 seconds"}
-	for _, s := range cases {
-		_, err := parseDuration(s)
-		if err == nil {
-			t.Errorf("parseDuration(%q): expected error but got none", s)
-		}
+func TestRetryPolicy_UnmarshalString(t *testing.T) {
+	data := []byte(`{"restart_delay":"30s","error_window":"5m","error_threshold":3}`)
+	var rp RetryPolicy
+	if err := json.Unmarshal(data, &rp); err != nil {
+		t.Fatalf("UnmarshalJSON: %v", err)
+	}
+	if rp.RestartDelay != 30*time.Second {
+		t.Errorf("RestartDelay: got %v want 30s", rp.RestartDelay)
+	}
+	if rp.ErrorWindow != 5*time.Minute {
+		t.Errorf("ErrorWindow: got %v want 5m", rp.ErrorWindow)
+	}
+}
+
+func TestRetryPolicy_InvalidDuration(t *testing.T) {
+	data := []byte(`{"restart_delay":"invalid"}`)
+	var rp RetryPolicy
+	if err := json.Unmarshal(data, &rp); err == nil {
+		t.Error("expected error for invalid duration")
+	}
+}
+
+func TestRetryPolicy_MarshalOmitsZeroDurations(t *testing.T) {
+	rp := RetryPolicy{ErrorThreshold: 5}
+	b, err := json.Marshal(rp)
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	var m map[string]interface{}
+	_ = json.Unmarshal(b, &m)
+	if _, ok := m["restart_delay"]; ok {
+		t.Error("restart_delay should be omitted when zero")
+	}
+	if _, ok := m["error_window"]; ok {
+		t.Error("error_window should be omitted when zero")
 	}
 }
 

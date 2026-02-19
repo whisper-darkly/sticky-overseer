@@ -1,8 +1,12 @@
 package overseer
 
 import (
+	"errors"
+	"path/filepath"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestOpenDB_Idempotent(t *testing.T) {
@@ -116,8 +120,8 @@ func TestCreateGetTask_WithRetryPolicy(t *testing.T) {
 	defer db.Close()
 
 	rp := &RetryPolicy{
-		RestartDelay:   "5s",
-		ErrorWindow:    "1m",
+		RestartDelay:   5 * time.Second,
+		ErrorWindow:    1 * time.Minute,
 		ErrorThreshold: 3,
 	}
 	rec := TaskRecord{
@@ -139,8 +143,11 @@ func TestCreateGetTask_WithRetryPolicy(t *testing.T) {
 	if got.RetryPolicy == nil {
 		t.Fatal("RetryPolicy is nil")
 	}
-	if got.RetryPolicy.RestartDelay != "5s" {
-		t.Errorf("RestartDelay: got %q", got.RetryPolicy.RestartDelay)
+	if got.RetryPolicy.RestartDelay != 5*time.Second {
+		t.Errorf("RestartDelay: got %v want 5s", got.RetryPolicy.RestartDelay)
+	}
+	if got.RetryPolicy.ErrorWindow != 1*time.Minute {
+		t.Errorf("ErrorWindow: got %v want 1m", got.RetryPolicy.ErrorWindow)
 	}
 	if got.RetryPolicy.ErrorThreshold != 3 {
 		t.Errorf("ErrorThreshold: got %d", got.RetryPolicy.ErrorThreshold)
@@ -286,5 +293,69 @@ func TestScanTaskRow_NullOptionalFields(t *testing.T) {
 	}
 	if got.ErrorMessage != "" {
 		t.Errorf("ErrorMessage should be empty, got %q", got.ErrorMessage)
+	}
+}
+
+func TestExitTimestamps_RoundTrip(t *testing.T) {
+	db, err := OpenDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	rec := TaskRecord{
+		TaskID:    "ts-test",
+		Command:   "/bin/echo",
+		Args:      []string{},
+		State:     StateActive,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := createTask(db, rec); err != nil {
+		t.Fatalf("createTask: %v", err)
+	}
+
+	ts := []time.Time{
+		time.Now().UTC().Truncate(time.Second),
+		time.Now().UTC().Add(time.Minute).Truncate(time.Second),
+	}
+	if err := updateTaskExitTimestamps(db, "ts-test", ts); err != nil {
+		t.Fatalf("updateTaskExitTimestamps: %v", err)
+	}
+
+	got, err := getTask(db, "ts-test")
+	if err != nil {
+		t.Fatalf("getTask: %v", err)
+	}
+	if len(got.ExitTimestamps) != 2 {
+		t.Fatalf("ExitTimestamps: got %d entries want 2", len(got.ExitTimestamps))
+	}
+	if !got.ExitTimestamps[0].Equal(ts[0]) {
+		t.Errorf("ExitTimestamps[0]: got %v want %v", got.ExitTimestamps[0], ts[0])
+	}
+	if !got.ExitTimestamps[1].Equal(ts[1]) {
+		t.Errorf("ExitTimestamps[1]: got %v want %v", got.ExitTimestamps[1], ts[1])
+	}
+}
+
+func TestOpenDB_SchemaMismatch_V1(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Manually create a v2 database, then downgrade its version to simulate v1.
+	{
+		seed, err := OpenDB(path)
+		if err != nil {
+			t.Fatalf("initial OpenDB: %v", err)
+		}
+		if _, err := seed.Exec(`UPDATE schema_version SET version = 1`); err != nil {
+			seed.Close()
+			t.Fatalf("UPDATE schema_version: %v", err)
+		}
+		seed.Close()
+	}
+
+	_, err := OpenDB(path)
+	if !errors.Is(err, ErrSchemaMismatch) {
+		t.Errorf("expected ErrSchemaMismatch, got %v", err)
 	}
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -75,7 +74,7 @@ func main() {
 			log.Fatalf("failed to open log file %s: %v", logPath, err)
 		}
 		defer f.Close()
-		cfg.EventLog = json.NewEncoder(f)
+		cfg.EventLog = f
 		log.Printf("event log: %s", logPath)
 	}
 

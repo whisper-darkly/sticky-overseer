@@ -10,34 +10,27 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Task state constants. Use these instead of bare strings when filtering or
-// setting TaskRecord.State.
-const (
-	StateActive  = "active"
-	StateStopped = "stopped"
-	StateErrored = "errored"
-)
-
 // schemaVersion is incremented whenever a breaking schema change is made.
 // OpenDB returns ErrSchemaMismatch if the on-disk version is older.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // ErrSchemaMismatch is returned by OpenDB when the database was created by an
 // older (or newer) version of the library and needs migration.
 var ErrSchemaMismatch = errors.New("overseer: database schema version mismatch — manual migration required")
 
 type TaskRecord struct {
-	TaskID        string
-	Command       string
-	Args          []string
-	RetryPolicy   *RetryPolicy
-	State         string // see StateActive / StateStopped / StateErrored
-	RestartCount  int
-	ExitCount     int
-	CreatedAt     time.Time
-	LastStartedAt *time.Time
-	LastExitedAt  *time.Time
-	ErrorMessage  string
+	TaskID         string
+	Command        string
+	Args           []string
+	RetryPolicy    *RetryPolicy
+	State          TaskState // see StateActive / StateStopped / StateErrored
+	RestartCount   int
+	ExitCount      int
+	CreatedAt      time.Time
+	LastStartedAt  *time.Time
+	LastExitedAt   *time.Time
+	ErrorMessage   string
+	ExitTimestamps []time.Time // persisted exit times for error-window tracking
 }
 
 // OpenDB opens (or creates) the SQLite database at path and applies the schema.
@@ -89,17 +82,18 @@ func OpenDB(path string) (*sql.DB, error) {
 	}
 
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tasks (
-		task_id         TEXT PRIMARY KEY,
-		command         TEXT NOT NULL,
-		args            TEXT NOT NULL,
-		retry_policy    TEXT,
-		state           TEXT NOT NULL DEFAULT 'active',
-		restart_count   INTEGER NOT NULL DEFAULT 0,
-		exit_count      INTEGER NOT NULL DEFAULT 0,
-		created_at      TEXT NOT NULL,
-		last_started_at TEXT,
-		last_exited_at  TEXT,
-		error_message   TEXT
+		task_id          TEXT PRIMARY KEY,
+		command          TEXT NOT NULL,
+		args             TEXT NOT NULL,
+		retry_policy     TEXT,
+		state            TEXT NOT NULL DEFAULT 'active',
+		restart_count    INTEGER NOT NULL DEFAULT 0,
+		exit_count       INTEGER NOT NULL DEFAULT 0,
+		created_at       TEXT NOT NULL,
+		last_started_at  TEXT,
+		last_exited_at   TEXT,
+		error_message    TEXT,
+		exit_timestamps  TEXT NOT NULL DEFAULT '[]'
 	)`); err != nil {
 		db.Close()
 		return nil, err
@@ -122,25 +116,26 @@ func createTask(db *sql.DB, r TaskRecord) error {
 		s := string(b)
 		rpJSON = &s
 	}
+	tsJSON := encodeTimestamps(r.ExitTimestamps)
 	_, err = db.Exec(`INSERT INTO tasks
-		(task_id, command, args, retry_policy, state, restart_count, exit_count, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.TaskID, r.Command, string(argsJSON), rpJSON, r.State,
-		r.RestartCount, r.ExitCount, r.CreatedAt.UTC().Format(time.RFC3339Nano),
+		(task_id, command, args, retry_policy, state, restart_count, exit_count, created_at, exit_timestamps)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.TaskID, r.Command, string(argsJSON), rpJSON, string(r.State),
+		r.RestartCount, r.ExitCount, r.CreatedAt.UTC().Format(time.RFC3339Nano), tsJSON,
 	)
 	return err
 }
 
 func getTask(db *sql.DB, taskID string) (*TaskRecord, error) {
 	row := db.QueryRow(`SELECT task_id, command, args, retry_policy, state,
-		restart_count, exit_count, created_at, last_started_at, last_exited_at, error_message
+		restart_count, exit_count, created_at, last_started_at, last_exited_at, error_message, exit_timestamps
 		FROM tasks WHERE task_id = ?`, taskID)
 	return scanTaskRow(row)
 }
 
 func listTasks(db *sql.DB) ([]TaskRecord, error) {
 	rows, err := db.Query(`SELECT task_id, command, args, retry_policy, state,
-		restart_count, exit_count, created_at, last_started_at, last_exited_at, error_message
+		restart_count, exit_count, created_at, last_started_at, last_exited_at, error_message, exit_timestamps
 		FROM tasks ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -157,9 +152,9 @@ func listTasks(db *sql.DB) ([]TaskRecord, error) {
 	return out, rows.Err()
 }
 
-func updateTaskState(db *sql.DB, taskID, state, errMsg string) error {
+func updateTaskState(db *sql.DB, taskID string, state TaskState, errMsg string) error {
 	_, err := db.Exec(`UPDATE tasks SET state = ?, error_message = ? WHERE task_id = ?`,
-		state, errMsg, taskID)
+		string(state), errMsg, taskID)
 	return err
 }
 
@@ -178,9 +173,41 @@ func updateTaskStats(db *sql.DB, taskID string, restartCount, exitCount int, las
 	return err
 }
 
+func updateTaskExitTimestamps(db *sql.DB, taskID string, ts []time.Time) error {
+	_, err := db.Exec(`UPDATE tasks SET exit_timestamps = ? WHERE task_id = ?`,
+		encodeTimestamps(ts), taskID)
+	return err
+}
+
 func deleteTask(db *sql.DB, taskID string) error {
 	_, err := db.Exec(`DELETE FROM tasks WHERE task_id = ?`, taskID)
 	return err
+}
+
+// encodeTimestamps serialises a []time.Time as a JSON array of RFC3339Nano strings.
+func encodeTimestamps(ts []time.Time) string {
+	strs := make([]string, len(ts))
+	for i, t := range ts {
+		strs[i] = t.UTC().Format(time.RFC3339Nano)
+	}
+	b, _ := json.Marshal(strs)
+	return string(b)
+}
+
+// decodeTimestamps deserialises a JSON array of RFC3339Nano strings into []time.Time.
+func decodeTimestamps(s string) []time.Time {
+	var strs []string
+	if err := json.Unmarshal([]byte(s), &strs); err != nil {
+		return nil
+	}
+	ts := make([]time.Time, 0, len(strs))
+	for _, str := range strs {
+		t, err := time.Parse(time.RFC3339Nano, str)
+		if err == nil {
+			ts = append(ts, t)
+		}
+	}
+	return ts
 }
 
 // scanner interface covers both *sql.Row and *sql.Rows
@@ -195,13 +222,16 @@ func scanTaskRow(s scanner) (*TaskRecord, error) {
 	var createdAtStr string
 	var lastStartedAtStr, lastExitedAtStr *string
 	var errMsg *string
+	var exitTsJSON string
+	var stateStr string
 
-	err := s.Scan(&r.TaskID, &r.Command, &argsJSON, &rpJSON, &r.State,
-		&r.RestartCount, &r.ExitCount, &createdAtStr, &lastStartedAtStr, &lastExitedAtStr, &errMsg)
+	err := s.Scan(&r.TaskID, &r.Command, &argsJSON, &rpJSON, &stateStr,
+		&r.RestartCount, &r.ExitCount, &createdAtStr, &lastStartedAtStr, &lastExitedAtStr, &errMsg, &exitTsJSON)
 	if err != nil {
 		return nil, err
 	}
 
+	r.State = TaskState(stateStr)
 	if err := json.Unmarshal([]byte(argsJSON), &r.Args); err != nil {
 		r.Args = []string{}
 	}
@@ -221,5 +251,6 @@ func scanTaskRow(s scanner) (*TaskRecord, error) {
 	if errMsg != nil {
 		r.ErrorMessage = *errMsg
 	}
+	r.ExitTimestamps = decodeTimestamps(exitTsJSON)
 	return &r, nil
 }

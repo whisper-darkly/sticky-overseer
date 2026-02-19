@@ -9,7 +9,7 @@ func newTestWorker() *Worker {
 	return &Worker{
 		PID:    1234,
 		TaskID: "test-task",
-		State:  "running",
+		State:  WorkerRunning,
 	}
 }
 

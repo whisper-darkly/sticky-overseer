@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -21,9 +22,9 @@ var wsUpgrader = websocket.Upgrader{
 
 // HubConfig holds all options for creating a Hub.
 type HubConfig struct {
-	DB            *sql.DB       // required; use OpenDB() to create
-	PinnedCommand string        // optional; restricts start commands
-	EventLog      *json.Encoder // optional; JSONL event log writer
+	DB            *sql.DB   // required; use OpenDB() to create
+	PinnedCommand string    // optional; restricts start commands
+	EventLog      io.Writer // optional; hub creates json.Encoder internally; nil = no log
 }
 
 // Task is the in-memory representation of a persistent task.
@@ -31,7 +32,7 @@ type Task struct {
 	mu          sync.Mutex
 	record      TaskRecord
 	worker      *Worker     // current running worker, nil if not running
-	exitHistory []time.Time // non-intentional exits for threshold tracking (not persisted)
+	exitHistory []time.Time // non-intentional exits for threshold tracking
 }
 
 type Hub struct {
@@ -51,7 +52,9 @@ func NewHub(cfg HubConfig) *Hub {
 		tasks:         make(map[string]*Task),
 		db:            cfg.DB,
 		pinnedCommand: cfg.PinnedCommand,
-		eventLog:      cfg.EventLog,
+	}
+	if cfg.EventLog != nil {
+		h.eventLog = json.NewEncoder(cfg.EventLog)
 	}
 	if cfg.DB != nil {
 		records, err := listTasks(cfg.DB)
@@ -60,11 +63,12 @@ func NewHub(cfg HubConfig) *Hub {
 		} else {
 			for _, r := range records {
 				r := r
-				if r.State == "active" {
-					r.State = "stopped"
-					_ = updateTaskState(cfg.DB, r.TaskID, "stopped", "")
+				if r.State == StateActive {
+					r.State = StateStopped
+					_ = updateTaskState(cfg.DB, r.TaskID, StateStopped, "")
 				}
-				h.tasks[r.TaskID] = &Task{record: r}
+				task := &Task{record: r, exitHistory: r.ExitTimestamps}
+				h.tasks[r.TaskID] = task
 			}
 			log.Printf("loaded %d tasks from db (all marked stopped)", len(records))
 		}
@@ -287,7 +291,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 			Command:     command,
 			Args:        args,
 			RetryPolicy: msg.RetryPolicy,
-			State:       "active",
+			State:       StateActive,
 			CreatedAt:   now,
 		}
 		if h.db != nil {
@@ -307,7 +311,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 
 	if task.worker != nil {
 		task.worker.mu.Lock()
-		running := task.worker.State == "running"
+		running := task.worker.State == WorkerRunning
 		task.worker.mu.Unlock()
 		if running {
 			h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task already has a running worker"})
@@ -315,8 +319,8 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 		}
 	}
 
-	task.record.State = "active"
-	w, err := StartWorker(h, WorkerConfig{TaskID: taskID, Command: command, Args: args})
+	task.record.State = StateActive
+	w, err := startWorker(h, workerConfig{TaskID: taskID, Command: command, Args: args})
 	if err != nil {
 		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
 		return
@@ -326,7 +330,7 @@ func (h *Hub) handleStart(conn *websocket.Conn, msg IncomingMessage) {
 	now := time.Now().UTC()
 	task.record.LastStartedAt = &now
 	if h.db != nil {
-		_ = updateTaskState(h.db, taskID, "active", "")
+		_ = updateTaskState(h.db, taskID, StateActive, "")
 		_ = updateTaskStats(h.db, taskID, task.record.RestartCount, task.record.ExitCount, &now, task.record.LastExitedAt)
 	}
 
@@ -388,14 +392,14 @@ func (h *Hub) handleStop(conn *websocket.Conn, msg IncomingMessage) {
 	task.mu.Lock()
 	defer task.mu.Unlock()
 
-	task.record.State = "stopped"
+	task.record.State = StateStopped
 	if h.db != nil {
-		_ = updateTaskState(h.db, msg.TaskID, "stopped", "")
+		_ = updateTaskState(h.db, msg.TaskID, StateStopped, "")
 	}
 
 	if task.worker != nil {
 		task.worker.mu.Lock()
-		running := task.worker.State == "running"
+		running := task.worker.State == WorkerRunning
 		task.worker.mu.Unlock()
 		if running {
 			log.Printf("stopping worker task=%s pid=%d", msg.TaskID, task.worker.PID)
@@ -420,20 +424,21 @@ func (h *Hub) handleReset(conn *websocket.Conn, msg IncomingMessage) {
 	task.mu.Lock()
 	defer task.mu.Unlock()
 
-	if task.record.State != "errored" {
+	if task.record.State != StateErrored {
 		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: "task is not in errored state"})
 		return
 	}
 
-	task.record.State = "active"
+	task.record.State = StateActive
 	task.record.ExitCount = 0
 	task.exitHistory = nil
 	if h.db != nil {
-		_ = updateTaskState(h.db, msg.TaskID, "active", "")
+		_ = updateTaskState(h.db, msg.TaskID, StateActive, "")
 		_ = updateTaskStats(h.db, msg.TaskID, task.record.RestartCount, 0, task.record.LastStartedAt, task.record.LastExitedAt)
+		_ = updateTaskExitTimestamps(h.db, msg.TaskID, nil)
 	}
 
-	w, err := StartWorker(h, WorkerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
+	w, err := startWorker(h, workerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
 	if err != nil {
 		h.sendJSON(conn, ErrorMessage{Type: "error", ID: msg.ID, Message: err.Error()})
 		return
@@ -520,7 +525,7 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 		_ = updateTaskStats(h.db, w.TaskID, task.record.RestartCount, task.record.ExitCount, task.record.LastStartedAt, &now)
 	}
 
-	if intentional || task.record.State == "stopped" {
+	if intentional || task.record.State == StateStopped {
 		return
 	}
 
@@ -529,48 +534,41 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 		return
 	}
 
-	if rp.ErrorWindow != "" {
-		window, err := parseDuration(rp.ErrorWindow)
-		if err == nil {
-			cutoff := now.Add(-window)
-			var pruned []time.Time
-			for _, t := range task.exitHistory {
-				if !t.Before(cutoff) {
-					pruned = append(pruned, t)
-				}
+	if rp.ErrorWindow != 0 {
+		cutoff := now.Add(-rp.ErrorWindow)
+		var pruned []time.Time
+		for _, t := range task.exitHistory {
+			if !t.Before(cutoff) {
+				pruned = append(pruned, t)
 			}
-			task.exitHistory = pruned
 		}
+		task.exitHistory = pruned
 	}
 	task.exitHistory = append(task.exitHistory, now)
 	task.record.ExitCount = len(task.exitHistory)
 
 	if h.db != nil {
 		_ = updateTaskStats(h.db, w.TaskID, task.record.RestartCount, task.record.ExitCount, task.record.LastStartedAt, &now)
+		_ = updateTaskExitTimestamps(h.db, w.TaskID, task.exitHistory)
 	}
 
 	if rp.ErrorThreshold > 0 && task.record.ExitCount >= rp.ErrorThreshold {
-		task.record.State = "errored"
+		task.record.State = StateErrored
 		if h.db != nil {
-			_ = updateTaskState(h.db, w.TaskID, "errored", "exit threshold reached")
+			_ = updateTaskState(h.db, w.TaskID, StateErrored, "exit threshold reached")
 		}
 		h.Broadcast(ErroredMessage{Type: "errored", TaskID: w.TaskID, PID: w.PID, ExitCount: task.record.ExitCount, TS: now})
 		log.Printf("task=%s errored after %d exits", w.TaskID, task.record.ExitCount)
 		return
 	}
 
-	restartDelay := 0 * time.Second
-	if rp.RestartDelay != "" {
-		if d, err := parseDuration(rp.RestartDelay); err == nil {
-			restartDelay = d
-		}
-	}
+	restartDelay := rp.RestartDelay
 	attempt := task.record.RestartCount + 1
 	h.Broadcast(RestartingMessage{
 		Type:         "restarting",
 		TaskID:       w.TaskID,
 		PID:          w.PID,
-		RestartDelay: restartDelay.String(),
+		RestartDelay: restartDelay,
 		Attempt:      attempt,
 		TS:           now,
 	})
@@ -586,12 +584,12 @@ func (h *Hub) doRestart(task *Task, oldPID int, attempt int, delay time.Duration
 	task.mu.Lock()
 	defer task.mu.Unlock()
 
-	if task.record.State != "active" {
+	if task.record.State != StateActive {
 		log.Printf("task=%s restart cancelled (state=%s)", task.record.TaskID, task.record.State)
 		return
 	}
 
-	w, err := StartWorker(h, WorkerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
+	w, err := startWorker(h, workerConfig{TaskID: task.record.TaskID, Command: task.record.Command, Args: task.record.Args})
 	if err != nil {
 		log.Printf("task=%s restart failed: %v", task.record.TaskID, err)
 		return
@@ -620,6 +618,7 @@ func taskInfo(task *Task) TaskInfo {
 		CreatedAt:     r.CreatedAt,
 		LastStartedAt: r.LastStartedAt,
 		LastExitedAt:  r.LastExitedAt,
+		ErrorMessage:  r.ErrorMessage,
 	}
 	if info.Args == nil {
 		info.Args = []string{}
@@ -628,13 +627,13 @@ func taskInfo(task *Task) TaskInfo {
 		task.worker.mu.Lock()
 		info.CurrentPID = task.worker.PID
 		info.WorkerState = task.worker.State
+		if task.worker.ExitCode != nil {
+			ec := *task.worker.ExitCode
+			info.LastExitCode = &ec
+		}
 		task.worker.mu.Unlock()
 	}
 	return info
-}
-
-func parseDuration(s string) (time.Duration, error) {
-	return time.ParseDuration(s)
 }
 
 func newUUID() string {

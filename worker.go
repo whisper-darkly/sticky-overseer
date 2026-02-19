@@ -11,7 +11,7 @@ import (
 
 const ringBufferSize = 100
 
-type WorkerConfig struct {
+type workerConfig struct {
 	TaskID  string
 	Command string
 	Args    []string
@@ -22,15 +22,15 @@ type Worker struct {
 	TaskID    string
 	Command   string
 	Args      []string
-	State     string // "running" or "exited"
+	State     WorkerState
 	StartedAt time.Time
 	ExitedAt  *time.Time
 	ExitCode  *int
 
-	cmd            *exec.Cmd
-	mu             sync.Mutex
-	events         []Event
-	hub            *Hub
+	cmd             *exec.Cmd
+	mu              sync.Mutex
+	events          []Event
+	hub             *Hub
 	intentionalStop bool
 }
 
@@ -70,7 +70,7 @@ func (w *Worker) lastEventAt() *time.Time {
 	return &t
 }
 
-func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
+func startWorker(hub *Hub, cfg workerConfig) (*Worker, error) {
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -90,7 +90,7 @@ func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
 		TaskID:    cfg.TaskID,
 		Command:   cfg.Command,
 		Args:      cfg.Args,
-		State:     "running",
+		State:     WorkerRunning,
 		StartedAt: time.Now().UTC(),
 		cmd:       cmd,
 		hub:       hub,
@@ -99,7 +99,7 @@ func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	scan := func(scanner *bufio.Scanner, stream string) {
+	scan := func(scanner *bufio.Scanner, stream Stream) {
 		defer wg.Done()
 		for scanner.Scan() {
 			now := time.Now().UTC()
@@ -112,8 +112,8 @@ func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
 		}
 	}
 
-	go scan(bufio.NewScanner(stdout), "stdout")
-	go scan(bufio.NewScanner(stderr), "stderr")
+	go scan(bufio.NewScanner(stdout), StreamStdout)
+	go scan(bufio.NewScanner(stderr), StreamStderr)
 
 	go func() {
 		wg.Wait()
@@ -128,7 +128,7 @@ func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
 			}
 		}
 		w.mu.Lock()
-		w.State = "exited"
+		w.State = WorkerExited
 		w.ExitedAt = &now
 		w.ExitCode = &exitCode
 		intentional := w.intentionalStop
@@ -145,7 +145,7 @@ func StartWorker(hub *Hub, cfg WorkerConfig) (*Worker, error) {
 
 func (w *Worker) Stop() {
 	w.mu.Lock()
-	if w.State != "running" || w.cmd.Process == nil {
+	if w.State != WorkerRunning || w.cmd.Process == nil {
 		w.mu.Unlock()
 		return
 	}
@@ -156,7 +156,7 @@ func (w *Worker) Stop() {
 	go func() {
 		time.Sleep(5 * time.Second)
 		w.mu.Lock()
-		running := w.State == "running"
+		running := w.State == WorkerRunning
 		w.mu.Unlock()
 		if running {
 			_ = w.cmd.Process.Kill()
