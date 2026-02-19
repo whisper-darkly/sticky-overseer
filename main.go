@@ -28,7 +28,7 @@ func main() {
 	flag.Parse()
 
 	if *showHelp {
-		fmt.Printf("sticky_overseer %s (%s)\n\n", version, commit)
+		fmt.Printf("sticky-overseer %s (%s)\n\n", version, commit)
 		fmt.Println("WebSocket-based process overseer for spawning and tracking child processes.")
 		fmt.Println()
 		fmt.Println("Flags:")
@@ -42,7 +42,7 @@ func main() {
 	}
 
 	if *showVersion {
-		fmt.Printf("sticky_overseer %s (%s)\n", version, commit)
+		fmt.Printf("sticky-overseer %s (%s)\n", version, commit)
 		os.Exit(0)
 	}
 

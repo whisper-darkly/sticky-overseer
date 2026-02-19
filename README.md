@@ -1,4 +1,4 @@
-# sticky_overseer
+# sticky-overseer
 
 WebSocket-based process overseer that spawns, tracks, and relays output from child processes in real-time.
 
@@ -19,13 +19,13 @@ make install PREFIX=~/.local  # custom prefix
 
 ```bash
 # Basic
-./sticky_overseer
+./sticky-overseer
 
 # Pin to a specific command
-./sticky_overseer -command sticky-recorder
+./sticky-overseer -command sticky-recorder
 
 # Custom port
-OVERSEER_PORT=9090 ./sticky_overseer
+OVERSEER_PORT=9090 ./sticky-overseer
 ```
 
 Connect via WebSocket at `ws://host:8080/ws`.

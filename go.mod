@@ -1,4 +1,4 @@
-module sticky_overseer
+module sticky-overseer
 
 go 1.22.2
 

@@ -1,4 +1,4 @@
-VERSION ?= 0.1.0
+VERSION ?= 0.2.0
 COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 LDFLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT)"
 PREFIX  ?= /usr/local
@@ -7,11 +7,11 @@ PREFIX  ?= /usr/local
 
 build:
 	@mkdir -p dist
-	go build $(LDFLAGS) -o dist/sticky_overseer .
+	go build $(LDFLAGS) -o dist/sticky-overseer .
 
 install: build
 	install -d $(PREFIX)/bin
-	install -m 755 dist/sticky_overseer $(PREFIX)/bin/sticky_overseer
+	install -m 755 dist/sticky-overseer $(PREFIX)/bin/sticky-overseer
 
 clean:
 	rm -rf dist
