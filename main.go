@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"flag"
 	"fmt"
 	"log"
@@ -11,6 +12,9 @@ import (
 	"syscall"
 	"time"
 )
+
+//go:embed docker/playground.html
+var playgroundHTML []byte
 
 var (
 	version = "dev"
@@ -94,6 +98,10 @@ func main() {
 	}
 
 	http.Handle("/ws", newHandler(hub, nets))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(playgroundHTML)
+	})
 
 	srv := &http.Server{Addr: ":" + port}
 

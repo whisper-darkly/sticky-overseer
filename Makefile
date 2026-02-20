@@ -36,7 +36,7 @@ test-docker: build
 
 build:
 	@mkdir -p dist
-	go build $(LDFLAGS) -o dist/sticky-overseer ./cmd/sticky-overseer
+	go build $(LDFLAGS) -o dist/sticky-overseer .
 
 install: build
 	install -d $(PREFIX)/bin
