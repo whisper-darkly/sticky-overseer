@@ -1,4 +1,4 @@
-package overseer
+package main
 
 import (
 	"testing"

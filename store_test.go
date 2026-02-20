@@ -1,4 +1,4 @@
-package overseer
+package main
 
 import (
 	"errors"
@@ -12,7 +12,7 @@ import (
 func TestOpenDB_Idempotent(t *testing.T) {
 	// Opening the same in-memory DB twice is not meaningful (each :memory: open
 	// is independent), so we just verify OpenDB succeeds and the schema is usable.
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestOpenDB_Idempotent(t *testing.T) {
 }
 
 func TestOpenDB_SchemaMismatch(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -36,15 +36,15 @@ func TestOpenDB_SchemaMismatch(t *testing.T) {
 		t.Fatalf("UPDATE schema_version: %v", err)
 	}
 	// Can't reopen :memory: — but we can verify the sentinel error is exported
-	// and the ErrSchemaMismatch sentinel is the right type.
+	// and the errSchemaMismatch sentinel is the right type.
 	db.Close()
-	if ErrSchemaMismatch == nil {
-		t.Error("ErrSchemaMismatch should be non-nil sentinel")
+	if errSchemaMismatch == nil {
+		t.Error("errSchemaMismatch should be non-nil sentinel")
 	}
 }
 
 func TestOpenDB_WALMode(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestStateConstants(t *testing.T) {
 }
 
 func TestCreateGetTask_RoundTrip(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestCreateGetTask_RoundTrip(t *testing.T) {
 }
 
 func TestCreateGetTask_WithRetryPolicy(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestCreateGetTask_WithRetryPolicy(t *testing.T) {
 }
 
 func TestListTasks_OrderAndMultipleRows(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestListTasks_OrderAndMultipleRows(t *testing.T) {
 }
 
 func TestUpdateTaskState(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestUpdateTaskState(t *testing.T) {
 }
 
 func TestUpdateTaskStats(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestUpdateTaskStats(t *testing.T) {
 }
 
 func TestDeleteTask(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestDeleteTask(t *testing.T) {
 }
 
 func TestScanTaskRow_NullOptionalFields(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,7 +297,7 @@ func TestScanTaskRow_NullOptionalFields(t *testing.T) {
 }
 
 func TestExitTimestamps_RoundTrip(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +338,7 @@ func TestExitTimestamps_RoundTrip(t *testing.T) {
 }
 
 func TestGetTask_NotFound(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestGetTask_NotFound(t *testing.T) {
 }
 
 func TestListTasks_Empty(t *testing.T) {
-	db, err := OpenDB(":memory:")
+	db, err := openDB(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +399,7 @@ func TestOpenDB_SchemaMismatch_V1(t *testing.T) {
 
 	// Manually create a v2 database, then downgrade its version to simulate v1.
 	{
-		seed, err := OpenDB(path)
+		seed, err := openDB(path)
 		if err != nil {
 			t.Fatalf("initial OpenDB: %v", err)
 		}
@@ -410,8 +410,8 @@ func TestOpenDB_SchemaMismatch_V1(t *testing.T) {
 		seed.Close()
 	}
 
-	_, err := OpenDB(path)
-	if !errors.Is(err, ErrSchemaMismatch) {
-		t.Errorf("expected ErrSchemaMismatch, got %v", err)
+	_, err := openDB(path)
+	if !errors.Is(err, errSchemaMismatch) {
+		t.Errorf("expected errSchemaMismatch, got %v", err)
 	}
 }

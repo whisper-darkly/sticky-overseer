@@ -10,9 +10,6 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-	overseer "github.com/whisper-darkly/sticky-overseer"
-	_ "modernc.org/sqlite"
 )
 
 var (
@@ -60,14 +57,14 @@ func main() {
 		resolvedDB = "./overseer.db"
 	}
 
-	db, err := overseer.OpenDB(resolvedDB)
+	db, err := openDB(resolvedDB)
 	if err != nil {
 		log.Fatalf("failed to open database %s: %v", resolvedDB, err)
 	}
 	defer db.Close()
 	log.Printf("database: %s", resolvedDB)
 
-	cfg := overseer.HubConfig{
+	cfg := hubConfig{
 		DB:            db,
 		PinnedCommand: *pinnedCmd,
 	}
@@ -86,17 +83,17 @@ func main() {
 		log.Printf("command pinned to: %s", *pinnedCmd)
 	}
 
-	hub := overseer.NewHub(cfg)
+	hub := newHub(cfg)
 
-	nets, err := overseer.ParseTrustedCIDRs(os.Getenv("OVERSEER_TRUSTED_CIDRS"))
+	nets, err := parseTrustedCIDRs(os.Getenv("OVERSEER_TRUSTED_CIDRS"))
 	if err != nil {
 		log.Fatalf("OVERSEER_TRUSTED_CIDRS: %v", err)
 	}
 	if nets == nil {
-		nets = overseer.DetectLocalSubnets()
+		nets = detectLocalSubnets()
 	}
 
-	http.Handle("/ws", overseer.NewHandler(hub, nets))
+	http.Handle("/ws", newHandler(hub, nets))
 
 	srv := &http.Server{Addr: ":" + port}
 

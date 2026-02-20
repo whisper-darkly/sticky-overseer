@@ -1,4 +1,4 @@
-package overseer
+package main
 
 import (
 	"context"
@@ -21,8 +21,8 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// HubConfig holds all options for creating a Hub.
-type HubConfig struct {
+// hubConfig holds all options for creating a Hub.
+type hubConfig struct {
 	DB            *sql.DB   // required; use OpenDB() to create
 	PinnedCommand string    // optional; restricts start commands
 	EventLog      io.Writer // optional; hub creates json.Encoder internally; nil = no log
@@ -48,8 +48,8 @@ type Hub struct {
 	shutdownOnce  sync.Once
 }
 
-// NewHub creates a Hub, loads persisted tasks from DB, and marks them stopped.
-func NewHub(cfg HubConfig) *Hub {
+// newHub creates a Hub, loads persisted tasks from DB, and marks them stopped.
+func newHub(cfg hubConfig) *Hub {
 	h := &Hub{
 		clients:    make(map[*websocket.Conn]*sync.Mutex),
 		tasks:      make(map[string]*Task),
@@ -79,19 +79,6 @@ func NewHub(cfg HubConfig) *Hub {
 	}
 	return h
 }
-
-// Hubber is the interface implemented by *Hub. Consumers that need mock-ability
-// (tests, embedded services) can accept Hubber instead of the concrete *Hub.
-type Hubber interface {
-	AddClient(conn *websocket.Conn)
-	RemoveClient(conn *websocket.Conn)
-	Broadcast(msg any)
-	HandleClient(conn *websocket.Conn)
-	Shutdown(ctx context.Context) error
-}
-
-// compile-time check that *Hub satisfies Hubber.
-var _ Hubber = (*Hub)(nil)
 
 // Shutdown signals all pending restarts to abort, stops every running worker,
 // and waits for them to exit or ctx to expire.
@@ -147,10 +134,10 @@ func (h *Hub) hasRunningWorkers() bool {
 	return false
 }
 
-// NewHandler returns an http.HandlerFunc that upgrades HTTP to WebSocket,
+// newHandler returns an http.HandlerFunc that upgrades HTTP to WebSocket,
 // enforces IP trust, and delegates to hub.HandleClient.
 // Pass nil trustedNets to allow connections from any IP.
-func NewHandler(h Hubber, trustedNets []*net.IPNet) http.HandlerFunc {
+func newHandler(h *Hub, trustedNets []*net.IPNet) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !isTrusted(r, trustedNets) {
 			http.Error(w, "forbidden", http.StatusForbidden)
@@ -167,9 +154,9 @@ func NewHandler(h Hubber, trustedNets []*net.IPNet) http.HandlerFunc {
 	}
 }
 
-// ParseTrustedCIDRs parses a comma-separated list of bare IPs and CIDR ranges.
+// parseTrustedCIDRs parses a comma-separated list of bare IPs and CIDR ranges.
 // Returns nil, nil for an empty string; callers interpret nil as "allow all".
-func ParseTrustedCIDRs(s string) ([]*net.IPNet, error) {
+func parseTrustedCIDRs(s string) ([]*net.IPNet, error) {
 	if s == "" {
 		return nil, nil
 	}
@@ -198,9 +185,9 @@ func ParseTrustedCIDRs(s string) ([]*net.IPNet, error) {
 	return nets, nil
 }
 
-// DetectLocalSubnets returns loopback (127.0.0.0/8, ::1/128) plus all
+// detectLocalSubnets returns loopback (127.0.0.0/8, ::1/128) plus all
 // subnets found on local network interfaces.
-func DetectLocalSubnets() []*net.IPNet {
+func detectLocalSubnets() []*net.IPNet {
 	var nets []*net.IPNet
 	_, lo4, _ := net.ParseCIDR("127.0.0.0/8")
 	_, lo6, _ := net.ParseCIDR("::1/128")

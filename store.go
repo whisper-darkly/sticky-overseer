@@ -1,4 +1,4 @@
-package overseer
+package main
 
 import (
 	"database/sql"
@@ -14,9 +14,9 @@ import (
 // OpenDB returns ErrSchemaMismatch if the on-disk version is older.
 const schemaVersion = 2
 
-// ErrSchemaMismatch is returned by OpenDB when the database was created by an
-// older (or newer) version of the library and needs migration.
-var ErrSchemaMismatch = errors.New("overseer: database schema version mismatch — manual migration required")
+// errSchemaMismatch is returned by openDB when the database was created by an
+// older (or newer) version and needs migration.
+var errSchemaMismatch = errors.New("overseer: database schema version mismatch — manual migration required")
 
 type TaskRecord struct {
 	TaskID         string
@@ -33,12 +33,12 @@ type TaskRecord struct {
 	ExitTimestamps []time.Time // persisted exit times for error-window tracking
 }
 
-// OpenDB opens (or creates) the SQLite database at path and applies the schema.
+// openDB opens (or creates) the SQLite database at path and applies the schema.
 // Pass ":memory:" for an in-memory database (useful in tests).
 //
 // WAL journal mode and a 5 s busy timeout are always enabled so that multiple
 // processes sharing the same file do not deadlock under concurrent load.
-func OpenDB(path string) (*sql.DB, error) {
+func openDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -78,7 +78,7 @@ func OpenDB(path string) (*sql.DB, error) {
 		return nil, err
 	case ver != schemaVersion:
 		db.Close()
-		return nil, fmt.Errorf("%w: on-disk version %d, library version %d", ErrSchemaMismatch, ver, schemaVersion)
+		return nil, fmt.Errorf("%w: on-disk version %d, binary version %d", errSchemaMismatch, ver, schemaVersion)
 	}
 
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tasks (

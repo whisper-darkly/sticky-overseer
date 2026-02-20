@@ -1,4 +1,4 @@
-package overseer
+package main
 
 import (
 	"encoding/json"
@@ -9,7 +9,7 @@ import (
 )
 
 func TestIsTrusted_Loopback(t *testing.T) {
-	nets := DetectLocalSubnets()
+	nets := detectLocalSubnets()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "127.0.0.1:9000"
 	if !isTrusted(req, nets) {
@@ -18,7 +18,7 @@ func TestIsTrusted_Loopback(t *testing.T) {
 }
 
 func TestIsTrusted_OutOfRange(t *testing.T) {
-	nets := DetectLocalSubnets()
+	nets := detectLocalSubnets()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "203.0.113.1:9000" // TEST-NET-3 (RFC 5737)
 	if isTrusted(req, nets) {
@@ -123,7 +123,7 @@ func TestRetryPolicy_MarshalOmitsZeroDurations(t *testing.T) {
 }
 
 func TestIsTrusted_IPv6Loopback(t *testing.T) {
-	nets := DetectLocalSubnets()
+	nets := detectLocalSubnets()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "[::1]:9000"
 	if !isTrusted(req, nets) {
@@ -132,7 +132,7 @@ func TestIsTrusted_IPv6Loopback(t *testing.T) {
 }
 
 func TestIsTrusted_MalformedAddr(t *testing.T) {
-	nets := DetectLocalSubnets()
+	nets := detectLocalSubnets()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "notanaddr"
 	if isTrusted(req, nets) {
@@ -163,7 +163,7 @@ func TestRestartingMessage_MarshalJSON(t *testing.T) {
 }
 
 func TestParseTrustedCIDRs_Empty(t *testing.T) {
-	nets, err := ParseTrustedCIDRs("")
+	nets, err := parseTrustedCIDRs("")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestParseTrustedCIDRs_Empty(t *testing.T) {
 }
 
 func TestParseTrustedCIDRs_Valid(t *testing.T) {
-	nets, err := ParseTrustedCIDRs("127.0.0.1,10.0.0.0/8")
+	nets, err := parseTrustedCIDRs("127.0.0.1,10.0.0.0/8")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestParseTrustedCIDRs_Valid(t *testing.T) {
 }
 
 func TestParseTrustedCIDRs_Invalid(t *testing.T) {
-	_, err := ParseTrustedCIDRs("not-an-ip")
+	_, err := parseTrustedCIDRs("not-an-ip")
 	if err == nil {
 		t.Error("expected error for invalid IP")
 	}
