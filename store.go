@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"database/sql"
@@ -8,7 +8,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// openDB opens the SQLite database at path and configures WAL mode + busy timeout.
+// OpenDB opens the SQLite database at path and configures WAL mode + busy timeout.
 // Pass ":memory:" for an in-memory database (used in tests).
 //
 // WAL journal mode and a 5 s busy timeout are always enabled so that multiple
@@ -17,7 +17,7 @@ import (
 // The exit_history table is created on first open. It stores non-intentional
 // process exit timestamps keyed by (action, exited_at) for retry-window tracking
 // that persists across overseer restarts.
-func openDB(path string) (*sql.DB, error) {
+func OpenDB(path string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err

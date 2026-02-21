@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"bufio"
@@ -11,7 +11,7 @@ import (
 
 const ringBufferSize = 100
 
-type workerConfig struct {
+type WorkerConfig struct {
 	TaskID         string
 	Command        string
 	Args           []string
@@ -19,12 +19,12 @@ type workerConfig struct {
 	IncludeStderr  bool // if false, stderr is drained but not forwarded to callbacks
 }
 
-// workerCallbacks are injected into each worker at start time, decoupling
+// WorkerCallbacks are injected into each worker at start time, decoupling
 // Worker from Hub and enabling isolated unit testing.
-type workerCallbacks struct {
-	onOutput func(msg *OutputMessage) // receives pointer so callers may stamp Seq before addEvent
-	logEvent func(v any)
-	onExited func(w *Worker, exitCode int, intentional bool, t time.Time)
+type WorkerCallbacks struct {
+	OnOutput func(msg *OutputMessage) // receives pointer so callers may stamp Seq before addEvent
+	LogEvent func(v any)
+	OnExited func(w *Worker, exitCode int, intentional bool, t time.Time)
 }
 
 type Worker struct {
@@ -40,7 +40,7 @@ type Worker struct {
 	cmd             *exec.Cmd
 	mu              sync.Mutex
 	events          []Event
-	callbacks       workerCallbacks
+	callbacks       WorkerCallbacks
 	intentionalStop bool
 	stopCh          chan struct{} // signals kill goroutine to proceed/cancel
 }
@@ -81,7 +81,7 @@ func (w *Worker) lastEventAt() *time.Time {
 	return &t
 }
 
-func startWorker(cfg workerConfig, cb workerCallbacks) (*Worker, error) {
+func StartWorker(cfg WorkerConfig, cb WorkerCallbacks) (*Worker, error) {
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 
 	// Set process group to enable group signaling — ensures child processes
@@ -130,13 +130,13 @@ func startWorker(cfg workerConfig, cb workerCallbacks) (*Worker, error) {
 			}
 			now := time.Now().UTC()
 			line := scanner.Text()
-			// Call onOutput first so it can stamp Seq (and optionally filter);
+			// Call OnOutput first so it can stamp Seq (and optionally filter);
 			// then store the event with the Seq value already set.
 			msg := &OutputMessage{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
-			w.callbacks.onOutput(msg)
+			w.callbacks.OnOutput(msg)
 			evt := Event{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now, Seq: msg.Seq}
 			w.addEvent(evt)
-			w.callbacks.logEvent(*msg)
+			w.callbacks.LogEvent(*msg)
 		}
 		// Check for scanner errors after loop — large lines (>scanMaxSize) cause
 		// silent failures without this check.
@@ -181,7 +181,7 @@ func startWorker(cfg workerConfig, cb workerCallbacks) (*Worker, error) {
 		evt := Event{Type: "exited", TaskID: w.TaskID, PID: w.PID, ExitCode: &exitCode, Intentional: intentional, TS: now}
 		w.addEvent(evt)
 		log.Printf("worker task=%s pid=%d exited code=%d intentional=%v", w.TaskID, w.PID, exitCode, intentional)
-		w.callbacks.onExited(w, exitCode, intentional, now)
+		w.callbacks.OnExited(w, exitCode, intentional, now)
 	}()
 
 	return w, nil
@@ -232,4 +232,18 @@ func (w *Worker) Stop() {
 	// Close stopCh so the kill goroutine exits immediately if Stop is called
 	// multiple times or during shutdown.
 	close(w.stopCh)
+}
+
+// NewWorkerCallbacks constructs a WorkerCallbacks value. Provided for external
+// packages (e.g. the exec sub-package) that need to create callbacks in tests.
+func NewWorkerCallbacks(
+	onOutput func(msg *OutputMessage),
+	logEvent func(v any),
+	onExited func(w *Worker, exitCode int, intentional bool, t time.Time),
+) WorkerCallbacks {
+	return WorkerCallbacks{
+		OnOutput: onOutput,
+		LogEvent: logEvent,
+		OnExited: onExited,
+	}
 }

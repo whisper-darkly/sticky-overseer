@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"database/sql"
@@ -9,7 +9,7 @@ import (
 // openTestDB opens an in-memory SQLite DB for testing and returns a cleanup function.
 func openTestDB(t *testing.T) (*sql.DB, func()) {
 	t.Helper()
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
 		t.Fatalf("openTestDB: %v", err)
 	}
@@ -17,18 +17,18 @@ func openTestDB(t *testing.T) (*sql.DB, func()) {
 }
 
 func TestOpenDB_InMemory(t *testing.T) {
-	// Verify openDB succeeds with an in-memory database.
-	db, err := openDB(":memory:")
+	// Verify OpenDB succeeds with an in-memory database.
+	db, err := OpenDB(":memory:")
 	if err != nil {
-		t.Fatalf("openDB: %v", err)
+		t.Fatalf("OpenDB: %v", err)
 	}
 	defer db.Close()
 }
 
 func TestOpenDB_WALMode(t *testing.T) {
-	db, err := openDB(":memory:")
+	db, err := OpenDB(":memory:")
 	if err != nil {
-		t.Fatalf("openDB: %v", err)
+		t.Fatalf("OpenDB: %v", err)
 	}
 	defer db.Close()
 
@@ -37,7 +37,7 @@ func TestOpenDB_WALMode(t *testing.T) {
 		t.Fatalf("PRAGMA journal_mode: %v", err)
 	}
 	// In-memory SQLite always reports "memory" for journal_mode regardless of
-	// the WAL pragma, so we just verify the pragma did not error during openDB.
+	// the WAL pragma, so we just verify the pragma did not error during OpenDB.
 	_ = mode
 }
 

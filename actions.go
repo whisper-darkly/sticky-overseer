@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"encoding/json"
@@ -20,9 +20,9 @@ type ActionHandler interface {
 	Validate(params map[string]string) error
 
 	// Start launches a worker for the given taskID with the supplied
-	// params. The workerCallbacks are injected to decouple the worker
+	// params. The WorkerCallbacks are injected to decouple the worker
 	// from the hub. Returns the running Worker or an error.
-	Start(taskID string, params map[string]string, cb workerCallbacks) (*Worker, error)
+	Start(taskID string, params map[string]string, cb WorkerCallbacks) (*Worker, error)
 }
 
 // ActionHandlerFactory creates ActionHandler instances from configuration.
@@ -72,17 +72,17 @@ type ActionInfo struct {
 // It is populated at init() time and read-only afterwards; no mutex required.
 var factoryRegistry []ActionHandlerFactory
 
-// RegisterFactory registers an ActionHandlerFactory so that buildActionHandlers
+// RegisterFactory registers an ActionHandlerFactory so that BuildActionHandlers
 // can look it up by type name. Must be called from init() functions only —
 // access is not thread-safe.
 func RegisterFactory(f ActionHandlerFactory) {
 	factoryRegistry = append(factoryRegistry, f)
 }
 
-// buildActionHandlers instantiates one ActionHandler per entry in cfg.Actions.
+// BuildActionHandlers instantiates one ActionHandler per entry in cfg.Actions.
 // Returns an error if any action references an unknown factory type or if the
 // factory's Create call fails.
-func buildActionHandlers(cfg *Config) (map[string]ActionHandler, error) {
+func BuildActionHandlers(cfg *Config) (map[string]ActionHandler, error) {
 	result := make(map[string]ActionHandler, len(cfg.Actions))
 
 	for name, actionCfg := range cfg.Actions {

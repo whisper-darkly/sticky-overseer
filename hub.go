@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"context"
@@ -16,8 +16,8 @@ import (
 	"time"
 )
 
-// hubConfig holds all options for creating a Hub.
-type hubConfig struct {
+// HubConfig holds all options for creating a Hub.
+type HubConfig struct {
 	DB          *sql.DB                  // reserved for future exit-history persistence (job 1370); not used for task CRUD
 	EventLog    io.Writer                // optional; nil = no log
 	Actions     map[string]ActionHandler // built once at startup; immutable
@@ -60,18 +60,18 @@ type Hub struct {
 	actions       map[string]ActionHandler       // immutable after startup
 	pool          *PoolManager                   // manages concurrency + queue
 	db            *sql.DB                        // optional; used for exit_history persistence (nil = no persistence)
-	metrics       *Metrics                       // in-memory metrics registry; never nil after newHub
+	metrics       *Metrics                       // in-memory metrics registry; never nil after NewHub
 	eventLog      *json.Encoder
 	eventLogMu    sync.Mutex // serialises concurrent Encode calls on eventLog
 	shutdownCh    chan struct{}
 	shutdownOnce  sync.Once
 }
 
-// newHub creates a Hub with an empty in-memory task map.
+// NewHub creates a Hub with an empty in-memory task map.
 // Tasks are not persisted across restarts — each startup begins fresh.
 // If cfg.DB is non-nil, exit_history records are persisted to SQLite and a
 // background pruner goroutine is started to prevent unbounded table growth.
-func newHub(cfg hubConfig) *Hub {
+func NewHub(cfg HubConfig) *Hub {
 	h := &Hub{
 		clients:       make(map[Conn]struct{}),
 		subscriptions: make(map[Conn]map[string]struct{}),
@@ -240,7 +240,7 @@ func isTrusted(r *http.Request, nets []*net.IPNet) bool {
 	return false
 }
 
-func (h *Hub) logEvent(v interface{}) {
+func (h *Hub) LogEvent(v interface{}) {
 	if h.eventLog == nil {
 		return
 	}
@@ -371,16 +371,16 @@ func (h *Hub) HandleClient(conn Conn) {
 // When task is non-nil, output messages are stamped with a per-task
 // monotonically increasing sequence number so reconnecting clients can
 // detect gaps caused by ring buffer overflow.
-func (h *Hub) workerCB() workerCallbacks {
+func (h *Hub) workerCB() WorkerCallbacks {
 	return h.workerCBForTask(nil)
 }
 
 // workerCBForTask builds callbacks bound to a specific task for sequence numbering.
 // Output and exit events are routed to BroadcastToSubscribers so only subscribed
 // clients receive task-specific events.
-func (h *Hub) workerCBForTask(task *Task) workerCallbacks {
-	return workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+func (h *Hub) workerCBForTask(task *Task) WorkerCallbacks {
+	return WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {
 			if task != nil {
 				task.mu.Lock()
 				task.outputSeq++
@@ -393,8 +393,8 @@ func (h *Hub) workerCBForTask(task *Task) workerCallbacks {
 				h.Broadcast(*msg)
 			}
 		},
-		logEvent: func(v any) { h.logEvent(v) },
-		onExited: func(w *Worker, code int, intentional bool, t time.Time) {
+		LogEvent: func(v any) { h.LogEvent(v) },
+		OnExited: func(w *Worker, code int, intentional bool, t time.Time) {
 			h.onWorkerExited(w, code, intentional, t)
 		},
 	}
@@ -564,7 +564,7 @@ func (h *Hub) handleStart(conn Conn, msg IncomingMessage) {
 		log.Printf("started worker task=%s pid=%d action=%s", taskID, w.PID, action)
 		started := StartedMessage{Type: "started", ID: msg.ID, TaskID: taskID, PID: w.PID, TS: w.StartedAt}
 		h.BroadcastToSubscribers(taskID, started)
-		h.logEvent(started)
+		h.LogEvent(started)
 		return nil
 	}
 
@@ -771,7 +771,7 @@ func (h *Hub) handleReset(conn Conn, msg IncomingMessage) {
 	log.Printf("reset task=%s, started pid=%d", msg.TaskID, w.PID)
 	started := StartedMessage{Type: "started", ID: msg.ID, TaskID: msg.TaskID, PID: w.PID, TS: w.StartedAt}
 	h.sendJSON(conn, started)
-	h.logEvent(started)
+	h.LogEvent(started)
 }
 
 func (h *Hub) handleReplay(conn Conn, msg IncomingMessage) {
@@ -962,7 +962,7 @@ func (h *Hub) handleSetPool(conn Conn, msg IncomingMessage) {
 func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time.Time) {
 	exited := ExitedMessage{Type: "exited", TaskID: w.TaskID, PID: w.PID, ExitCode: exitCode, Intentional: intentional, TS: now}
 	h.BroadcastToSubscribers(w.TaskID, exited)
-	h.logEvent(exited)
+	h.LogEvent(exited)
 
 	// Release the pool slot so the next queued task can start.
 	if h.pool != nil {

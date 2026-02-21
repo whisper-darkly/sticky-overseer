@@ -1,4 +1,4 @@
-package main
+package exec
 
 import (
 	"strings"
@@ -7,22 +7,20 @@ import (
 	"time"
 
 	"github.com/google/cel-go/cel"
+	overseer "github.com/whisper-darkly/sticky-overseer/v2"
 )
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// makeExecHandler builds an ExecHandler directly (bypassing the factory) for
-// simple unit tests that do not need the JSON round-trip config path.
-func makeExecHandler(name string, cfg ExecHandlerConfig, retry RetryPolicy, pool PoolConfig) (*ExecHandler, error) {
-	// Compile CEL programs for any parameters that have a Validate expression.
+func makeExecHandler(name string, cfg ExecHandlerConfig, retry overseer.RetryPolicy, pool overseer.PoolConfig) (*ExecHandler, error) {
 	celPrograms := make(map[string]cel.Program, len(cfg.Parameters))
 	for pname, spec := range cfg.Parameters {
 		if spec == nil || spec.Validate == "" {
 			continue
 		}
-		prog, err := CompileCELProgram(spec.Validate)
+		prog, err := overseer.CompileCELProgram(spec.Validate)
 		if err != nil {
 			return nil, err
 		}
@@ -39,7 +37,6 @@ func makeExecHandler(name string, cfg ExecHandlerConfig, retry RetryPolicy, pool
 	}, nil
 }
 
-// ptrStr returns a pointer to the given string literal, for use in ParamSpec.Default.
 func ptrStr(s string) *string { return &s }
 
 // ---------------------------------------------------------------------------
@@ -50,11 +47,11 @@ func TestExecHandler_Describe(t *testing.T) {
 	defaultVal := "default"
 	cfg := ExecHandlerConfig{
 		Entrypoint: "/bin/echo",
-		Parameters: map[string]*ParamSpec{
+		Parameters: map[string]*overseer.ParamSpec{
 			"msg": {Default: &defaultVal},
 		},
 	}
-	h, err := makeExecHandler("greet", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("greet", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected error creating handler: %v", err)
 	}
@@ -75,9 +72,9 @@ func TestExecHandler_Describe(t *testing.T) {
 func TestExecHandler_Describe_EmptyParams(t *testing.T) {
 	cfg := ExecHandlerConfig{
 		Entrypoint: "/bin/true",
-		Parameters: map[string]*ParamSpec{},
+		Parameters: map[string]*overseer.ParamSpec{},
 	}
-	h, err := makeExecHandler("noop", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("noop", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -92,17 +89,17 @@ func TestExecHandler_Describe_EmptyParams(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestExecHandler_Validate — required parameter missing
+// TestExecHandler_Validate
 // ---------------------------------------------------------------------------
 
 func TestExecHandler_Validate_Required(t *testing.T) {
 	cfg := ExecHandlerConfig{
 		Entrypoint: "/bin/echo",
-		Parameters: map[string]*ParamSpec{
+		Parameters: map[string]*overseer.ParamSpec{
 			"msg": {Default: nil, Validate: ""},
 		},
 	}
-	h, err := makeExecHandler("echo", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("echo", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected handler creation error: %v", err)
 	}
@@ -116,28 +113,22 @@ func TestExecHandler_Validate_Required(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestExecHandler_Validate — optional parameter gets default applied
-// ---------------------------------------------------------------------------
-
 func TestExecHandler_Validate_Default(t *testing.T) {
 	cfg := ExecHandlerConfig{
 		Entrypoint: "/bin/echo",
-		Parameters: map[string]*ParamSpec{
+		Parameters: map[string]*overseer.ParamSpec{
 			"greeting": {Default: ptrStr("hello"), Validate: ""},
 		},
 	}
-	h, err := makeExecHandler("echo", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("echo", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected handler creation error: %v", err)
 	}
 
-	// Validate succeeds even when the param is absent (has a default).
 	if err := h.Validate(map[string]string{}); err != nil {
 		t.Fatalf("unexpected validation error for param with default: %v", err)
 	}
 
-	// Confirm the default is present in the resolved map.
 	resolved, err := h.validateAndApplyDefaults(map[string]string{})
 	if err != nil {
 		t.Fatalf("unexpected error from validateAndApplyDefaults: %v", err)
@@ -147,18 +138,14 @@ func TestExecHandler_Validate_Default(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestExecHandler_Validate — CEL expression that passes
-// ---------------------------------------------------------------------------
-
 func TestExecHandler_Validate_CEL_Pass(t *testing.T) {
 	cfg := ExecHandlerConfig{
 		Entrypoint: "/bin/echo",
-		Parameters: map[string]*ParamSpec{
+		Parameters: map[string]*overseer.ParamSpec{
 			"env": {Default: nil, Validate: `value in ['dev', 'staging', 'prod']`},
 		},
 	}
-	h, err := makeExecHandler("deploy", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("deploy", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected handler creation error: %v", err)
 	}
@@ -168,18 +155,14 @@ func TestExecHandler_Validate_CEL_Pass(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestExecHandler_Validate — CEL expression that fails
-// ---------------------------------------------------------------------------
-
 func TestExecHandler_Validate_CEL_Fail(t *testing.T) {
 	cfg := ExecHandlerConfig{
 		Entrypoint: "/bin/echo",
-		Parameters: map[string]*ParamSpec{
+		Parameters: map[string]*overseer.ParamSpec{
 			"env": {Default: nil, Validate: `value in ['dev', 'staging', 'prod']`},
 		},
 	}
-	h, err := makeExecHandler("deploy", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("deploy", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected handler creation error: %v", err)
 	}
@@ -191,29 +174,29 @@ func TestExecHandler_Validate_CEL_Fail(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestExecHandler_Start — template rendering
+// TestExecHandler_Start
 // ---------------------------------------------------------------------------
 
 func TestExecHandler_Start_Template(t *testing.T) {
 	cfg := ExecHandlerConfig{
 		Entrypoint: "echo",
 		Command:    []string{"[[.msg]]"},
-		Parameters: map[string]*ParamSpec{
+		Parameters: map[string]*overseer.ParamSpec{
 			"msg": {Default: nil},
 		},
 	}
-	h, err := makeExecHandler("echo", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("echo", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected handler creation error: %v", err)
 	}
 
-	var capturedOutput []string
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
-			capturedOutput = append(capturedOutput, strings.TrimSpace(msg.Data))
+	done := make(chan struct{})
+	cb := overseer.WorkerCallbacks{
+		OnOutput: func(msg *overseer.OutputMessage) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *overseer.Worker, exitCode int, intentional bool, ts time.Time) {
+			close(done)
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
 	}
 
 	w, err := h.Start("task-1", map[string]string{"msg": "hello-world"}, cb)
@@ -224,31 +207,28 @@ func TestExecHandler_Start_Template(t *testing.T) {
 		t.Fatal("expected non-nil Worker from Start")
 	}
 
-	// Wait for the process to finish (best-effort; cmd is package-private).
-	// We give it a moment to avoid flakiness.
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for worker to exit")
+	}
 }
-
-// ---------------------------------------------------------------------------
-// TestExecHandler_Start_TemplateRenderError — bad template syntax
-// ---------------------------------------------------------------------------
 
 func TestExecHandler_Start_TemplateRenderError(t *testing.T) {
 	cfg := ExecHandlerConfig{
-		// An unclosed [[ delimiter causes a template parse error.
 		Entrypoint: "echo",
 		Command:    []string{"[[.unclosed"},
-		Parameters: map[string]*ParamSpec{},
+		Parameters: map[string]*overseer.ParamSpec{},
 	}
-	h, err := makeExecHandler("echo", cfg, RetryPolicy{}, PoolConfig{})
+	h, err := makeExecHandler("echo", cfg, overseer.RetryPolicy{}, overseer.PoolConfig{})
 	if err != nil {
 		t.Fatalf("unexpected handler creation error: %v", err)
 	}
 
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+	cb := overseer.WorkerCallbacks{
+		OnOutput: func(msg *overseer.OutputMessage) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *overseer.Worker, exitCode int, intentional bool, ts time.Time) {},
 	}
 
 	_, err = h.Start("task-2", map[string]string{}, cb)
@@ -272,7 +252,7 @@ func TestExecFactory_Create_Success(t *testing.T) {
 		},
 	}
 
-	handler, err := f.Create(config, "greet", RetryPolicy{}, PoolConfig{}, nil)
+	handler, err := f.Create(config, "greet", overseer.RetryPolicy{}, overseer.PoolConfig{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error from Create: %v", err)
 	}
@@ -289,10 +269,6 @@ func TestExecFactory_Create_Success(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestExecFactory_BadCEL — invalid CEL expression → error at Create time
-// ---------------------------------------------------------------------------
-
 func TestExecFactory_BadCEL(t *testing.T) {
 	f := &execHandlerFactory{}
 
@@ -300,20 +276,19 @@ func TestExecFactory_BadCEL(t *testing.T) {
 		"entrypoint": "/bin/echo",
 		"parameters": map[string]any{
 			"level": map[string]any{
-				// Intentionally invalid CEL syntax — unclosed bracket.
 				"validate": `value in [`,
 			},
 		},
 	}
 
-	_, err := f.Create(config, "badcel", RetryPolicy{}, PoolConfig{}, nil)
+	_, err := f.Create(config, "badcel", overseer.RetryPolicy{}, overseer.PoolConfig{}, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid CEL expression at Create time, got nil")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestRenderTemplate — unit tests for the helper function
+// TestRenderTemplate
 // ---------------------------------------------------------------------------
 
 func TestRenderTemplate_Simple(t *testing.T) {
@@ -347,7 +322,6 @@ func TestRenderTemplate_MultiplePlaceholders(t *testing.T) {
 }
 
 func TestRenderTemplate_ParseError(t *testing.T) {
-	// An unclosed delimiter should produce a parse error.
 	_, err := renderTemplate("[[.unclosed", map[string]string{})
 	if err == nil {
 		t.Fatal("expected parse error for malformed template, got nil")
@@ -355,8 +329,6 @@ func TestRenderTemplate_ParseError(t *testing.T) {
 }
 
 func TestRenderTemplate_ShellDollarUnaffected(t *testing.T) {
-	// $VAR (without braces) passes through untouched — our delimiters are
-	// [[ and ]], so $VARNAME and ${BAR} are never misinterpreted.
 	got, err := renderTemplate("export FOO=$BAR", map[string]string{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -367,30 +339,23 @@ func TestRenderTemplate_ShellDollarUnaffected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestExecFactory_RegisteredInRegistry — handler is findable via registry
+// TestExecFactory_TypeString
 // ---------------------------------------------------------------------------
 
-func TestExecFactory_RegisteredInRegistry(t *testing.T) {
-	var found bool
-	for _, f := range factoryRegistry {
-		if f.Type() == "exec" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Error("exec factory is not registered in factoryRegistry (init() may not have run)")
+func TestExecFactory_TypeString(t *testing.T) {
+	f := &execHandlerFactory{}
+	if f.Type() != "exec" {
+		t.Errorf("expected factory type %q, got %q", "exec", f.Type())
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestExecHandler_OutputFilter — CEL-based output filtering
+// TestExecHandler_OutputFilter
 // ---------------------------------------------------------------------------
 
 func TestExecHandler_OutputFilter_Stdout(t *testing.T) {
 	f := &execHandlerFactory{}
 
-	// Handler with stdout filter: only forward lines containing "PASS".
 	config := map[string]any{
 		"entrypoint": "/bin/sh",
 		"command":    []any{"-c", "echo PASS_line1; echo FAIL_line; echo PASS_line2"},
@@ -401,21 +366,24 @@ func TestExecHandler_OutputFilter_Stdout(t *testing.T) {
 		},
 	}
 
-	handler, err := f.Create(config, "filter-test", RetryPolicy{}, PoolConfig{}, nil)
+	handler, err := f.Create(config, "filter-test", overseer.RetryPolicy{}, overseer.PoolConfig{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error from Create: %v", err)
 	}
 
 	var mu sync.Mutex
 	var capturedLines []string
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+	done := make(chan struct{})
+	cb := overseer.WorkerCallbacks{
+		OnOutput: func(msg *overseer.OutputMessage) {
 			mu.Lock()
 			capturedLines = append(capturedLines, strings.TrimSpace(msg.Data))
 			mu.Unlock()
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *overseer.Worker, exitCode int, intentional bool, ts time.Time) {
+			close(done)
+		},
 	}
 
 	w, err := handler.Start("filter-task-1", map[string]string{}, cb)
@@ -426,16 +394,10 @@ func TestExecHandler_OutputFilter_Stdout(t *testing.T) {
 		t.Fatal("expected non-nil Worker")
 	}
 
-	// Wait for process to finish.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		w.mu.Lock()
-		done := w.State == WorkerExited
-		w.mu.Unlock()
-		if done {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for worker to exit")
 	}
 	time.Sleep(50 * time.Millisecond) // allow callbacks to flush
 
@@ -444,7 +406,6 @@ func TestExecHandler_OutputFilter_Stdout(t *testing.T) {
 	copy(lines, capturedLines)
 	mu.Unlock()
 
-	// Only lines containing "PASS" should be forwarded.
 	for _, line := range lines {
 		if !strings.Contains(line, "PASS") {
 			t.Errorf("unexpected line forwarded by filter: %q", line)
@@ -458,7 +419,6 @@ func TestExecHandler_OutputFilter_Stdout(t *testing.T) {
 func TestExecHandler_OutputFilter_EmptyCondition(t *testing.T) {
 	f := &execHandlerFactory{}
 
-	// Empty condition — all lines should be forwarded.
 	config := map[string]any{
 		"entrypoint": "/bin/sh",
 		"command":    []any{"-c", "echo line1; echo line2; echo line3"},
@@ -469,38 +429,35 @@ func TestExecHandler_OutputFilter_EmptyCondition(t *testing.T) {
 		},
 	}
 
-	handler, err := f.Create(config, "nofilter-test", RetryPolicy{}, PoolConfig{}, nil)
+	handler, err := f.Create(config, "nofilter-test", overseer.RetryPolicy{}, overseer.PoolConfig{}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error from Create: %v", err)
 	}
 
 	var mu sync.Mutex
 	var capturedLines []string
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+	done := make(chan struct{})
+	cb := overseer.WorkerCallbacks{
+		OnOutput: func(msg *overseer.OutputMessage) {
 			mu.Lock()
 			capturedLines = append(capturedLines, strings.TrimSpace(msg.Data))
 			mu.Unlock()
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *overseer.Worker, exitCode int, intentional bool, ts time.Time) {
+			close(done)
+		},
 	}
 
-	w, err := handler.Start("filter-task-2", map[string]string{}, cb)
+	_, err = handler.Start("filter-task-2", map[string]string{}, cb)
 	if err != nil {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	// Wait for process to finish.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		w.mu.Lock()
-		done := w.State == WorkerExited
-		w.mu.Unlock()
-		if done {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for worker to exit")
 	}
 	time.Sleep(50 * time.Millisecond)
 
@@ -516,17 +473,16 @@ func TestExecHandler_OutputFilter_EmptyCondition(t *testing.T) {
 func TestExecHandler_OutputFilter_BadCEL(t *testing.T) {
 	f := &execHandlerFactory{}
 
-	// Invalid CEL expression — should fail at Create time.
 	config := map[string]any{
 		"entrypoint": "/bin/echo",
 		"output": map[string]any{
 			"stdout": map[string]any{
-				"condition": `output.data.notAFunction(`, // invalid CEL
+				"condition": `output.data.notAFunction(`,
 			},
 		},
 	}
 
-	_, err := f.Create(config, "badcel-output", RetryPolicy{}, PoolConfig{}, nil)
+	_, err := f.Create(config, "badcel-output", overseer.RetryPolicy{}, overseer.PoolConfig{}, nil)
 	if err == nil {
 		t.Fatal("expected CEL compilation error at Create time, got nil")
 	}

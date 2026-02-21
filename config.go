@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"os"
@@ -81,9 +81,9 @@ func (p *ParamSpec) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// loadConfig reads the YAML config at path. If path is empty or the file does
+// LoadConfig reads the YAML config at path. If path is empty or the file does
 // not exist, a default config is returned with sensible defaults applied.
-func loadConfig(path string) (*Config, error) {
+func LoadConfig(path string) (*Config, error) {
 	cfg := &Config{}
 
 	if path != "" {

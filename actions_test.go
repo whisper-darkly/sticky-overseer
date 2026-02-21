@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"errors"
@@ -38,7 +38,7 @@ func (e *errorFactory) Create(config map[string]any, actionName string, mergedRe
 	return nil, errors.New("create failed intentionally")
 }
 
-// stubHandler is a minimal ActionHandler for testing buildActionHandlers.
+// stubHandler is a minimal ActionHandler for testing BuildActionHandlers.
 type stubHandler struct {
 	info ActionInfo
 }
@@ -47,7 +47,7 @@ func (h *stubHandler) Describe() ActionInfo { return h.info }
 
 func (h *stubHandler) Validate(params map[string]string) error { return nil }
 
-func (h *stubHandler) Start(taskID string, params map[string]string, cb workerCallbacks) (*Worker, error) {
+func (h *stubHandler) Start(taskID string, params map[string]string, cb WorkerCallbacks) (*Worker, error) {
 	return nil, errors.New("stubHandler.Start not implemented")
 }
 
@@ -102,7 +102,7 @@ func TestRegisterFactory_Multiple(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// buildActionHandlers tests
+// BuildActionHandlers tests
 // ---------------------------------------------------------------------------
 
 func TestBuildActionHandlers_UnknownType(t *testing.T) {
@@ -115,7 +115,7 @@ func TestBuildActionHandlers_UnknownType(t *testing.T) {
 			},
 		}
 
-		_, err := buildActionHandlers(cfg)
+		_, err := BuildActionHandlers(cfg)
 		if err == nil {
 			t.Fatal("expected an error for unknown action type, got nil")
 		}
@@ -133,7 +133,7 @@ func TestBuildActionHandlers_Success(t *testing.T) {
 			},
 		}
 
-		handlers, err := buildActionHandlers(cfg)
+		handlers, err := BuildActionHandlers(cfg)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -159,7 +159,7 @@ func TestBuildActionHandlers_CreateError(t *testing.T) {
 			},
 		}
 
-		_, err := buildActionHandlers(cfg)
+		_, err := BuildActionHandlers(cfg)
 		if err == nil {
 			t.Fatal("expected an error from Create, got nil")
 		}
@@ -172,7 +172,7 @@ func TestBuildActionHandlers_EmptyConfig(t *testing.T) {
 			Actions: map[string]ActionConfig{},
 		}
 
-		handlers, err := buildActionHandlers(cfg)
+		handlers, err := BuildActionHandlers(cfg)
 		if err != nil {
 			t.Fatalf("unexpected error for empty actions map: %v", err)
 		}

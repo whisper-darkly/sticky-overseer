@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"os"
@@ -11,9 +11,9 @@ import (
 // TestLoadConfig_Defaults verifies that an empty path returns a Config with
 // Listen=":8080" and DB="./overseer.db" without error.
 func TestLoadConfig_Defaults(t *testing.T) {
-	cfg, err := loadConfig("")
+	cfg, err := LoadConfig("")
 	if err != nil {
-		t.Fatalf("loadConfig(\"\") returned error: %v", err)
+		t.Fatalf("LoadConfig(\"\") returned error: %v", err)
 	}
 	if cfg.Listen != ":8080" {
 		t.Errorf("Listen = %q; want %q", cfg.Listen, ":8080")
@@ -59,9 +59,9 @@ actions:
 	}
 	f.Close()
 
-	cfg, err := loadConfig(f.Name())
+	cfg, err := LoadConfig(f.Name())
 	if err != nil {
-		t.Fatalf("loadConfig returned error: %v", err)
+		t.Fatalf("LoadConfig returned error: %v", err)
 	}
 
 	if cfg.Listen != ":9000" {
@@ -109,9 +109,9 @@ actions:
 
 // TestLoadConfig_FileNotFound verifies that a non-existent path returns defaults rather than an error.
 func TestLoadConfig_FileNotFound(t *testing.T) {
-	cfg, err := loadConfig("/nonexistent/path/to/config.yaml")
+	cfg, err := LoadConfig("/nonexistent/path/to/config.yaml")
 	if err != nil {
-		t.Fatalf("loadConfig with missing file returned error: %v", err)
+		t.Fatalf("LoadConfig with missing file returned error: %v", err)
 	}
 	if cfg.Listen != ":8080" {
 		t.Errorf("Listen = %q; want %q", cfg.Listen, ":8080")
@@ -131,7 +131,7 @@ func TestLoadConfig_InvalidYAML(t *testing.T) {
 	f.WriteString(": bad: yaml: {{{{")
 	f.Close()
 
-	_, err = loadConfig(f.Name())
+	_, err = LoadConfig(f.Name())
 	if err == nil {
 		t.Error("expected error for invalid YAML, got nil")
 	}
@@ -275,9 +275,9 @@ func TestLoadConfig_DefaultsAppliedAfterYAML(t *testing.T) {
 	f.WriteString(yamlContent)
 	f.Close()
 
-	cfg, err := loadConfig(f.Name())
+	cfg, err := LoadConfig(f.Name())
 	if err != nil {
-		t.Fatalf("loadConfig returned error: %v", err)
+		t.Fatalf("LoadConfig returned error: %v", err)
 	}
 	if cfg.Listen != ":7777" {
 		t.Errorf("Listen = %q; want %q", cfg.Listen, ":7777")

@@ -1,4 +1,4 @@
-package main
+package overseer
 
 import (
 	"sync"
@@ -126,12 +126,12 @@ func TestStop_AlreadyExited(t *testing.T) {
 	w.Stop() // must not panic
 }
 
-// TestStartWorker_BadCommand verifies that startWorker returns an error when
+// TestStartWorker_BadCommand verifies that StartWorker returns an error when
 // the executable does not exist.
 func TestStartWorker_BadCommand(t *testing.T) {
-	_, err := startWorker(
-		workerConfig{TaskID: "t", Command: "/nonexistent/binary/xyz"},
-		workerCallbacks{},
+	_, err := StartWorker(
+		WorkerConfig{TaskID: "t", Command: "/nonexistent/binary/xyz"},
+		WorkerCallbacks{},
 	)
 	if err == nil {
 		t.Error("expected error for non-existent command")
@@ -144,18 +144,18 @@ func TestStartWorker_BadCommand(t *testing.T) {
 func TestWorker_IncludeStdout_False(t *testing.T) {
 	var mu sync.Mutex
 	var received []OutputMessage
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+	cb := WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {
 			mu.Lock()
 			received = append(received, *msg)
 			mu.Unlock()
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
 	}
 
 	// Script writes one line to stdout and one line to stderr.
-	w, err := startWorker(workerConfig{
+	w, err := StartWorker(WorkerConfig{
 		TaskID:        "t-stdout-false",
 		Command:       "/bin/sh",
 		Args:          []string{"-c", "echo stdout_line; echo stderr_line >&2"},
@@ -163,7 +163,7 @@ func TestWorker_IncludeStdout_False(t *testing.T) {
 		IncludeStderr: true,
 	}, cb)
 	if err != nil {
-		t.Fatalf("startWorker: %v", err)
+		t.Fatalf("StartWorker: %v", err)
 	}
 
 	// Wait for the process to exit by polling ExitedAt.
@@ -203,17 +203,17 @@ func TestWorker_IncludeStdout_False(t *testing.T) {
 func TestWorker_IncludeStderr_False(t *testing.T) {
 	var mu sync.Mutex
 	var received []OutputMessage
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+	cb := WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {
 			mu.Lock()
 			received = append(received, *msg)
 			mu.Unlock()
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
 	}
 
-	w, err := startWorker(workerConfig{
+	w, err := StartWorker(WorkerConfig{
 		TaskID:        "t-stderr-false",
 		Command:       "/bin/sh",
 		Args:          []string{"-c", "echo stdout_line; echo stderr_line >&2"},
@@ -221,7 +221,7 @@ func TestWorker_IncludeStderr_False(t *testing.T) {
 		IncludeStderr: false,
 	}, cb)
 	if err != nil {
-		t.Fatalf("startWorker: %v", err)
+		t.Fatalf("StartWorker: %v", err)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -260,17 +260,17 @@ func TestWorker_IncludeStderr_False(t *testing.T) {
 func TestWorker_BothInclude_True(t *testing.T) {
 	var mu sync.Mutex
 	var received []OutputMessage
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+	cb := WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {
 			mu.Lock()
 			received = append(received, *msg)
 			mu.Unlock()
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
 	}
 
-	w, err := startWorker(workerConfig{
+	w, err := StartWorker(WorkerConfig{
 		TaskID:        "t-both-true",
 		Command:       "/bin/sh",
 		Args:          []string{"-c", "echo stdout_line; echo stderr_line >&2"},
@@ -278,7 +278,7 @@ func TestWorker_BothInclude_True(t *testing.T) {
 		IncludeStderr: true,
 	}, cb)
 	if err != nil {
-		t.Fatalf("startWorker: %v", err)
+		t.Fatalf("StartWorker: %v", err)
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -321,18 +321,18 @@ func TestLargeOutputLine(t *testing.T) {
 
 	var mu sync.Mutex
 	var received []string
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {
+	cb := WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {
 			mu.Lock()
 			received = append(received, msg.Data)
 			mu.Unlock()
 		},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {},
 	}
 
 	// Use python3 to write a 2MB line to stdout (no newline in the middle).
-	w, err := startWorker(workerConfig{
+	w, err := StartWorker(WorkerConfig{
 		TaskID:        "t-large-line",
 		Command:       "python3",
 		Args:          []string{"-c", "import sys; sys.stdout.write('x'*2097152 + '\\n'); sys.stdout.flush()"},
@@ -340,7 +340,7 @@ func TestLargeOutputLine(t *testing.T) {
 		IncludeStderr: false,
 	}, cb)
 	if err != nil {
-		t.Fatalf("startWorker: %v", err)
+		t.Fatalf("StartWorker: %v", err)
 	}
 
 	// Wait for the process to exit.
@@ -369,19 +369,19 @@ func TestLargeOutputLine(t *testing.T) {
 
 // TestScannerErr verifies that when the pipe is closed unexpectedly mid-scan
 // (simulating a scanner error), the worker transitions to WorkerExited and the
-// onExited callback is called — the exit is not silently dropped.
+// OnExited callback is called — the exit is not silently dropped.
 func TestScannerErr(t *testing.T) {
 	exitCalled := make(chan struct{}, 1)
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {
+	cb := WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {
 			exitCalled <- struct{}{}
 		},
 	}
 
 	// Start a process that exits quickly (pipe close will trigger scanner EOF).
-	w, err := startWorker(workerConfig{
+	w, err := StartWorker(WorkerConfig{
 		TaskID:        "t-scanner-err",
 		Command:       "/bin/sh",
 		Args:          []string{"-c", "echo hello; exit 1"},
@@ -389,15 +389,15 @@ func TestScannerErr(t *testing.T) {
 		IncludeStderr: true,
 	}, cb)
 	if err != nil {
-		t.Fatalf("startWorker: %v", err)
+		t.Fatalf("StartWorker: %v", err)
 	}
 	_ = w
 
 	select {
 	case <-exitCalled:
-		// Good — onExited was called.
+		// Good — OnExited was called.
 	case <-time.After(5 * time.Second):
-		t.Error("onExited callback was not called after process exit")
+		t.Error("OnExited callback was not called after process exit")
 	}
 }
 
@@ -408,17 +408,17 @@ func TestProcessGroupKill(t *testing.T) {
 	exitCalled := make(chan struct{}, 1)
 	var workerPID int
 
-	cb := workerCallbacks{
-		onOutput: func(msg *OutputMessage) {},
-		logEvent: func(v any) {},
-		onExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {
+	cb := WorkerCallbacks{
+		OnOutput: func(msg *OutputMessage) {},
+		LogEvent: func(v any) {},
+		OnExited: func(w *Worker, exitCode int, intentional bool, ts time.Time) {
 			exitCalled <- struct{}{}
 		},
 	}
 
 	// This shell script starts a long-running child (sleep 300) and then itself
 	// sleeps. When we stop the worker, both should be killed via process group.
-	w, err := startWorker(workerConfig{
+	w, err := StartWorker(WorkerConfig{
 		TaskID:        "t-pgkill",
 		Command:       "/bin/sh",
 		Args:          []string{"-c", "sleep 300 & sleep 300"},
@@ -426,7 +426,7 @@ func TestProcessGroupKill(t *testing.T) {
 		IncludeStderr: false,
 	}, cb)
 	if err != nil {
-		t.Fatalf("startWorker: %v", err)
+		t.Fatalf("StartWorker: %v", err)
 	}
 
 	// Wait until the process is actually running.

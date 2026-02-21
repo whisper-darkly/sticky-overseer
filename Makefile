@@ -6,7 +6,7 @@ PREFIX  ?= /usr/local
 .PHONY: build install clean generate test test-tools test-docker
 
 test:
-	go test -v -race ./...
+	go test -v -race ./... ./exec/...
 
 test-tools:
 	@echo "==> Installing test tools..."
@@ -39,7 +39,7 @@ generate:
 
 build: generate
 	@mkdir -p dist
-	go build $(LDFLAGS) -o dist/sticky-overseer .
+	go build $(LDFLAGS) -o dist/sticky-overseer ./cmd/sticky-overseer
 
 install: build
 	install -d $(PREFIX)/bin

@@ -1,6 +1,8 @@
-package main
+package overseer
 
 import (
+	_ "embed"
+
 	"bufio"
 	"context"
 	"encoding/json"
@@ -17,6 +19,12 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+//go:embed docker/playground.html
+var playgroundHTML []byte
+
+//go:embed docs/swagger.json
+var openAPISpec []byte
 
 // Conn represents a single client connection regardless of the underlying transport.
 // Implementations must be safe for concurrent ReadJSON calls from one goroutine

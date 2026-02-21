@@ -1,4 +1,4 @@
-module github.com/whisper-darkly/sticky-overseer
+module github.com/whisper-darkly/sticky-overseer/v2
 
 go 1.24.0
 
