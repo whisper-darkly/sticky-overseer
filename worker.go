@@ -12,15 +12,17 @@ import (
 const ringBufferSize = 100
 
 type workerConfig struct {
-	TaskID  string
-	Command string
-	Args    []string
+	TaskID         string
+	Command        string
+	Args           []string
+	IncludeStdout  bool // if false, stdout is drained but not forwarded to callbacks
+	IncludeStderr  bool // if false, stderr is drained but not forwarded to callbacks
 }
 
 // workerCallbacks are injected into each worker at start time, decoupling
 // Worker from Hub and enabling isolated unit testing.
 type workerCallbacks struct {
-	onOutput func(msg OutputMessage)
+	onOutput func(msg *OutputMessage) // receives pointer so callers may stamp Seq before addEvent
 	logEvent func(v any)
 	onExited func(w *Worker, exitCode int, intentional bool, t time.Time)
 }
@@ -40,6 +42,7 @@ type Worker struct {
 	events          []Event
 	callbacks       workerCallbacks
 	intentionalStop bool
+	stopCh          chan struct{} // signals kill goroutine to proceed/cancel
 }
 
 func (w *Worker) addEvent(e Event) {
@@ -80,6 +83,11 @@ func (w *Worker) lastEventAt() *time.Time {
 
 func startWorker(cfg workerConfig, cb workerCallbacks) (*Worker, error) {
 	cmd := exec.Command(cfg.Command, cfg.Args...)
+
+	// Set process group to enable group signaling — ensures child processes
+	// spawned by the command are also signaled on Stop().
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -102,26 +110,54 @@ func startWorker(cfg workerConfig, cb workerCallbacks) (*Worker, error) {
 		StartedAt: time.Now().UTC(),
 		cmd:       cmd,
 		callbacks: cb,
+		stopCh:    make(chan struct{}),
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	scan := func(scanner *bufio.Scanner, stream Stream) {
+	// Larger buffer to handle long output lines (1MB initial, 10MB max).
+	const scanBufSize = 1 << 20  // 1MB
+	const scanMaxSize = 10 << 20 // 10MB
+
+	// Pipes must always be drained even when output is filtered, to prevent
+	// the child process from blocking on a full pipe buffer.
+	scan := func(scanner *bufio.Scanner, stream Stream, include bool) {
 		defer wg.Done()
 		for scanner.Scan() {
+			if !include {
+				continue
+			}
 			now := time.Now().UTC()
 			line := scanner.Text()
-			evt := Event{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
-			w.addEvent(evt)
-			msg := OutputMessage{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
+			// Call onOutput first so it can stamp Seq (and optionally filter);
+			// then store the event with the Seq value already set.
+			msg := &OutputMessage{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now}
 			w.callbacks.onOutput(msg)
-			w.callbacks.logEvent(msg)
+			evt := Event{Type: "output", TaskID: w.TaskID, PID: w.PID, Stream: stream, Data: line, TS: now, Seq: msg.Seq}
+			w.addEvent(evt)
+			w.callbacks.logEvent(*msg)
+		}
+		// Check for scanner errors after loop — large lines (>scanMaxSize) cause
+		// silent failures without this check.
+		if err := scanner.Err(); err != nil {
+			log.Printf("worker task=%s stream=%s scanner error: %v", cfg.TaskID, stream, err)
+			w.mu.Lock()
+			if w.State == WorkerRunning {
+				w.State = WorkerExited
+			}
+			w.mu.Unlock()
 		}
 	}
 
-	go scan(bufio.NewScanner(stdout), StreamStdout)
-	go scan(bufio.NewScanner(stderr), StreamStderr)
+	// Create scanners and set large buffer BEFORE scanning.
+	stdoutScanner := bufio.NewScanner(stdout)
+	stdoutScanner.Buffer(make([]byte, scanBufSize), scanMaxSize)
+	go scan(stdoutScanner, StreamStdout, cfg.IncludeStdout)
+
+	stderrScanner := bufio.NewScanner(stderr)
+	stderrScanner.Buffer(make([]byte, scanBufSize), scanMaxSize)
+	go scan(stderrScanner, StreamStderr, cfg.IncludeStderr)
 
 	go func() {
 		wg.Wait()
@@ -160,14 +196,40 @@ func (w *Worker) Stop() {
 	w.intentionalStop = true
 	w.mu.Unlock()
 
-	_ = w.cmd.Process.Signal(syscall.SIGTERM)
+	// Send SIGTERM to entire process group (negative PID) so child processes
+	// spawned by the command are also signaled, preventing orphans.
+	pgid, err := syscall.Getpgid(w.cmd.Process.Pid)
+	if err == nil {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	} else {
+		_ = w.cmd.Process.Signal(syscall.SIGTERM)
+	}
+
+	// Cancellable kill goroutine: wait 5s or until stopCh is closed.
 	go func() {
-		time.Sleep(5 * time.Second)
+		select {
+		case <-time.After(5 * time.Second):
+			// 5 seconds elapsed, escalate to SIGKILL.
+		case <-w.stopCh:
+			// Stop was signalled — cancel the escalation.
+			return
+		}
+
 		w.mu.Lock()
 		running := w.State == WorkerRunning
 		w.mu.Unlock()
+
 		if running {
-			_ = w.cmd.Process.Kill()
+			pgid, err := syscall.Getpgid(w.cmd.Process.Pid)
+			if err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = w.cmd.Process.Kill()
+			}
 		}
 	}()
+
+	// Close stopCh so the kill goroutine exits immediately if Stop is called
+	// multiple times or during shutdown.
+	close(w.stopCh)
 }

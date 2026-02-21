@@ -3,7 +3,7 @@ COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 LDFLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT)"
 PREFIX  ?= /usr/local
 
-.PHONY: build install clean test test-tools test-docker
+.PHONY: build install clean generate test test-tools test-docker
 
 test:
 	go test -v -race ./...
@@ -34,7 +34,10 @@ test-tools:
 test-docker: build
 	bash docker/test.sh
 
-build:
+generate:
+	go generate ./...
+
+build: generate
 	@mkdir -p dist
 	go build $(LDFLAGS) -o dist/sticky-overseer .
 
