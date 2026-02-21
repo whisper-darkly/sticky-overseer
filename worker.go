@@ -2,6 +2,7 @@ package overseer
 
 import (
 	"bufio"
+	"context"
 	"log"
 	"os/exec"
 	"sync"
@@ -38,11 +39,12 @@ type Worker struct {
 	ExitCode  *int
 
 	cmd             *exec.Cmd
+	cancelFn        context.CancelFunc // non-nil for virtual workers; nil for OS-process workers
 	mu              sync.Mutex
 	events          []Event
 	callbacks       WorkerCallbacks
 	intentionalStop bool
-	stopCh          chan struct{} // signals kill goroutine to proceed/cancel
+	stopCh          chan struct{} // signals kill goroutine to proceed/cancel; used by OS-process workers only
 }
 
 func (w *Worker) addEvent(e Event) {
@@ -189,11 +191,26 @@ func StartWorker(cfg WorkerConfig, cb WorkerCallbacks) (*Worker, error) {
 
 func (w *Worker) Stop() {
 	w.mu.Lock()
-	if w.State != WorkerRunning || w.cmd.Process == nil {
+	if w.State != WorkerRunning {
 		w.mu.Unlock()
 		return
 	}
 	w.intentionalStop = true
+
+	// Virtual worker: cancel context and return — no process to signal.
+	if w.cmd == nil {
+		cancelFn := w.cancelFn
+		w.mu.Unlock()
+		if cancelFn != nil {
+			cancelFn()
+		}
+		return
+	}
+
+	if w.cmd.Process == nil {
+		w.mu.Unlock()
+		return
+	}
 	w.mu.Unlock()
 
 	// Send SIGTERM to entire process group (negative PID) so child processes
@@ -232,6 +249,64 @@ func (w *Worker) Stop() {
 	// Close stopCh so the kill goroutine exits immediately if Stop is called
 	// multiple times or during shutdown.
 	close(w.stopCh)
+}
+
+// VirtualWorkerFunc is the goroutine body for a virtual (non-process) worker.
+// ctx is cancelled when Stop() is called on the worker.
+// send emits a line of output to the task's subscribers.
+// The return value is used as the exit code (0 = success).
+type VirtualWorkerFunc func(ctx context.Context, send func(stream Stream, line string)) int
+
+// StartVirtualWorker creates a Worker backed by a Go goroutine rather than an
+// OS process. Useful for drivers that orchestrate Go-native work (e.g. file
+// conversion pipelines, HTTP fetches, directory watchers) without spawning a
+// subprocess.
+//
+// Stop() cancels the context passed to fn, signalling the function to exit.
+// The worker exits when fn returns; the return value becomes the exit code.
+func StartVirtualWorker(taskID string, fn VirtualWorkerFunc, cb WorkerCallbacks) (*Worker, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	w := &Worker{
+		PID:       0, // no OS process
+		TaskID:    taskID,
+		State:     WorkerRunning,
+		StartedAt: time.Now().UTC(),
+		callbacks: cb,
+		stopCh:    make(chan struct{}),
+		cancelFn:  cancel,
+	}
+
+	send := func(stream Stream, line string) {
+		now := time.Now().UTC()
+		msg := &OutputMessage{
+			Type: "output", TaskID: taskID, PID: 0,
+			Stream: stream, Data: line, TS: now,
+		}
+		cb.OnOutput(msg)
+		evt := Event{Type: "output", TaskID: taskID, PID: 0, Stream: stream, Data: line, TS: now, Seq: msg.Seq}
+		w.addEvent(evt)
+		cb.LogEvent(*msg)
+	}
+
+	go func() {
+		exitCode := fn(ctx, send)
+		cancel() // no-op if already cancelled by Stop()
+		now := time.Now().UTC()
+		w.mu.Lock()
+		w.State = WorkerExited
+		w.ExitedAt = &now
+		w.ExitCode = &exitCode
+		intentional := w.intentionalStop
+		w.mu.Unlock()
+
+		evt := Event{Type: "exited", TaskID: taskID, PID: 0, ExitCode: &exitCode, Intentional: intentional, TS: now}
+		w.addEvent(evt)
+		log.Printf("virtual worker task=%s exited code=%d intentional=%v", taskID, exitCode, intentional)
+		cb.OnExited(w, exitCode, intentional, now)
+	}()
+
+	return w, nil
 }
 
 // NewWorkerCallbacks constructs a WorkerCallbacks value. Provided for external

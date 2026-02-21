@@ -1,92 +1,197 @@
 # sticky-overseer
 
-WebSocket-based process overseer that spawns, tracks, and relays output from child processes in real-time.
+WebSocket-based process overseer — spawn, track, and stream output from child processes in real-time. Ships as both an **importable Go library** and a **pre-built binary**.
+
+## As a library
+
+Downstream projects import sticky-overseer and register custom action drivers:
+
+```go
+import (
+    overseer "github.com/whisper-darkly/sticky-overseer/v2"
+    _ "github.com/whisper-darkly/sticky-overseer/v2/exec"  // built-in exec driver
+    _ "myorg/drivers/converter"                             // custom driver
+)
+
+var version = "dev"
+var commit  = "unknown"
+
+func main() { overseer.RunCLI(version, commit) }
+```
+
+Drivers self-register at `init()` time (the database driver pattern). See the `exec/` package
+for a working reference implementation.
 
 ## Build
 
 ```bash
-make build
+make build        # → dist/sticky-overseer
+make install      # → /usr/local/bin/sticky-overseer
 ```
 
-## Install
+## Install from source
 
 ```bash
-make install              # installs to /usr/local/bin
-make install PREFIX=~/.local  # custom prefix
+go install github.com/whisper-darkly/sticky-overseer/v2/cmd/sticky-overseer@latest
 ```
 
 ## Usage
 
 ```bash
-# Basic — any client may start any process
-./sticky-overseer
-
-# Pin to a specific command (clients may omit the command field or must match exactly)
-./sticky-overseer -command /usr/local/bin/my-tool
-
-# Custom port
-OVERSEER_PORT=9090 ./sticky-overseer
+./sticky-overseer --config ./config.yaml
+./sticky-overseer --list-handlers    # print registered action driver types
+./sticky-overseer --version
 ```
-
-Connect via WebSocket at `ws://host:8080/ws`.
 
 ## Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `OVERSEER_PORT` | `8080` | Listen port |
-| `OVERSEER_TRUSTED_CIDRS` | auto-detect | Comma-separated IPs/CIDRs allowed to connect |
-| `OVERSEER_LOG_FILE` | — | Optional JSONL event log path |
-| `OVERSEER_DB` | — | Optional SQLite path for persistent task IDs |
+`config.yaml`:
+
+```yaml
+listen: ":8080"        # TCP address, or "unix:/path/to/sock" for Unix socket
+db: overseer.db        # SQLite path for exit-history (optional)
+trusted_cidrs: ""      # Comma-separated IPs/CIDRs; empty = auto-detect local subnets
+log_file: ""           # Optional JSONL event log
+
+# Global pool defaults (overridable per-action)
+task_pool:
+  size: 10             # max concurrent tasks (0 = unlimited)
+  queue_size: 100      # max queued tasks
+  queue_timeout: "0s"  # 0 = queue indefinitely
+
+retry: {}              # global retry policy; overridable per-action
+
+actions:
+  echo:
+    type: exec
+    config:
+      entrypoint: echo
+      command: ["[[.message]]"]
+      parameters:
+        message:
+          default: "hello"
+```
+
+### Environment overrides
+
+| Variable | Description |
+|---|---|
+| `OVERSEER_CONFIG` | Path to YAML config (overrides `--config`) |
+| `OVERSEER_LISTEN` | Listen address (overrides `config.listen`) |
+| `OVERSEER_DB` | SQLite path (overrides `config.db`) |
+| `OVERSEER_LOG_FILE` | JSONL event log path |
+
+## WebSocket Protocol
+
+Connect at `ws://host:8080/ws`. All messages are JSON. The optional `id` field echoes back in responses for request/response correlation.
+
+### Client → Server
+
+| `type` | Key fields | Description |
+|--------|-----------|-------------|
+| `start` | `action`, `task_id`, `params`, `retry_policy`, `force`, `id` | Start a task |
+| `stop` | `task_id`, `id` | SIGTERM → SIGKILL escalation |
+| `reset` | `task_id`, `id` | Clear errored state and restart |
+| `list` | `since` (RFC3339), `id` | List tasks |
+| `replay` | `task_id`, `since`, `id` | Replay ring-buffer to caller |
+| `subscribe` | `task_id` | Subscribe to a task's output |
+| `unsubscribe` | `task_id` | Unsubscribe |
+| `describe` | `id` | List registered actions and their parameters |
+| `pool_info` | `action`, `id` | Pool state for one or all actions |
+| `set_pool` | `action`, `size`, `id` | Resize a pool at runtime |
+| `purge` | `action`, `id` | Drain the queue for an action |
+| `metrics` | `action`, `task_id`, `id` | In-memory metrics |
+
+### Server → Client
+
+| `type` | Description |
+|--------|-------------|
+| `started` | Worker spawned (`task_id`, `pid`, `ts`) |
+| `output` | Stdout/stderr line (`task_id`, `stream`, `data`, `seq`, `ts`) |
+| `exited` | Worker exited (`task_id`, `exit_code`, `intentional`, `ts`) |
+| `restarting` | Retry scheduled (`task_id`, `attempt`, `restart_delay`, `ts`) |
+| `errored` | Retry threshold exceeded (`task_id`, `exit_count`, `ts`) |
+| `queued` | Task queued in pool (`task_id`, `position`, `ts`) |
+| `dequeued` | Queued task cancelled (`task_id`, `reason`, `ts`) |
+| `tasks` | Response to `list` |
+| `actions` | Response to `describe` |
+| `pool_info` | Response to `pool_info` |
+| `metrics` | Response to `metrics` |
+| `error` | Error response (`message`, `id`) |
+
+Output events include a monotonically increasing `seq` number per task. Clients can detect
+ring-buffer gaps after reconnection by comparing `seq` values.
+
+## Writing a custom driver
+
+Implement `overseer.ActionHandler` and `overseer.ActionHandlerFactory`, register via `init()`:
+
+```go
+package mydriver
+
+import (
+    "context"
+    overseer "github.com/whisper-darkly/sticky-overseer/v2"
+)
+
+type myHandler struct { cfg myConfig }
+
+func (h *myHandler) Describe() overseer.ActionInfo { ... }
+func (h *myHandler) Validate(params map[string]string) error { ... }
+func (h *myHandler) Start(taskID string, params map[string]string, cb overseer.WorkerCallbacks) (*overseer.Worker, error) {
+    // Option A: wrap an OS process
+    return overseer.StartWorker(overseer.WorkerConfig{
+        TaskID:        taskID,
+        Command:       "my-tool",
+        Args:          []string{params["input"]},
+        IncludeStdout: true,
+        IncludeStderr: true,
+    }, cb)
+
+    // Option B: wrap a Go goroutine
+    return overseer.StartVirtualWorker(taskID, func(ctx context.Context, send func(overseer.Stream, string)) int {
+        send(overseer.StreamStdout, "working...")
+        // ... do work, check ctx.Done() periodically ...
+        return 0
+    }, cb)
+}
+
+type myFactory struct{}
+func (f *myFactory) Type() string { return "mydriver" }
+func (f *myFactory) Create(config map[string]any, name string, retry overseer.RetryPolicy, pool overseer.PoolConfig, dedupe []string) (overseer.ActionHandler, error) {
+    // parse config map → myConfig
+    return &myHandler{cfg: parsed}, nil
+}
+
+func init() { overseer.RegisterFactory(&myFactory{}) }
+```
+
+### Background service drivers
+
+Drivers that need a long-running background goroutine (e.g. a directory watcher that
+auto-discovers work) implement `overseer.ServiceHandler`:
+
+```go
+// RunService is called once at startup; blocks until ctx is cancelled.
+func (h *myHandler) RunService(ctx context.Context, submit overseer.TaskSubmitter) {
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            // Discover work and submit tasks programmatically.
+            submit.Submit("mydriver", "", map[string]string{"file": "/path/to/file"})
+        }
+    }
+}
+```
 
 ## Docker
 
-A minimal Docker image (Alpine-based) is provided in `docker/`.
-
 ```bash
-# Build
-make -C docker build
-
-# Build and export as .tar
-make -C docker export
-
-# Run
+make -C docker build    # build image
+make -C docker export   # export as .tar
 docker run -p 8080:8080 sticky-overseer:latest
-
-# Pin to a command inside the container
-docker run -p 8080:8080 sticky-overseer:latest sticky-overseer -command /usr/local/bin/my-tool
 ```
-
-A `docker/compose.yaml` is also included as a starting point.
-
-### Integrating with another tool
-
-If you want to ship sticky-overseer bundled with your own binary (e.g. a recorder),
-the recommended pattern is to build that image from **your** repo:
-
-1. Start `FROM golang:1.24-alpine` and clone/build sticky-overseer alongside your own binary.
-2. Set `CMD ["sticky-overseer", "-command", "/usr/local/bin/your-tool"]`.
-3. Expose port 8080 (or whatever `OVERSEER_PORT` you configure).
-
-Your image owns its runtime dependencies (e.g. ffmpeg) — sticky-overseer stays generic.
-
-## Protocol
-
-All messages are JSON over WebSocket.
-
-### Client Commands
-
-- **start** — spawn a worker: `{"type":"start","id":"1","command":"echo","args":["hello"]}`
-- **list** — list all workers: `{"type":"list","id":"2"}` (optional `since` filter)
-- **stop** — SIGTERM a worker: `{"type":"stop","id":"3","pid":12345}`
-- **replay** — replay buffered events: `{"type":"replay","id":"4","pid":12345}` (optional `since` filter)
-
-### Server Events
-
-- **started** — worker spawned with PID
-- **output** — stdout/stderr line from a worker
-- **exited** — worker exited with code
-- **workers** — response to list
-- **error** — error response
-
-Workers retain their last 100 events in a ring buffer for replay after reconnection.

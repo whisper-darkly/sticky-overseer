@@ -322,6 +322,126 @@ func (h *Hub) BroadcastToSubscribers(taskID string, msg interface{}) {
 	}
 }
 
+// Submit programmatically starts a task, bypassing WebSocket. Implements
+// TaskSubmitter so Hub can be passed directly to ServiceHandler.RunService.
+//
+// actionName must match an action in the hub's action map. taskID may be
+// empty — a UUID is generated. Returns an error if the action is unknown,
+// params fail validation, or the taskID is already active/pending. Pool
+// queuing and deduplication behave identically to WebSocket-initiated starts.
+func (h *Hub) Submit(actionName, taskID string, params map[string]string) error {
+	if h.actions == nil {
+		return fmt.Errorf("no actions configured")
+	}
+
+	h.mu.RLock()
+	handler, ok := h.actions[actionName]
+	h.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("unknown action: %q", actionName)
+	}
+
+	if params == nil {
+		params = map[string]string{}
+	}
+
+	if err := handler.Validate(params); err != nil {
+		return fmt.Errorf("validation error: %w", err)
+	}
+
+	if taskID == "" {
+		taskID = newUUID()
+	}
+
+	h.mu.Lock()
+	_, existsInTasks := h.tasks[taskID]
+	_, existsInPending := h.pending[taskID]
+	if existsInTasks || existsInPending {
+		h.mu.Unlock()
+		return fmt.Errorf("task %q already running or starting", taskID)
+	}
+	h.pending[taskID] = struct{}{}
+	h.mu.Unlock()
+
+	startFn := func() error {
+		now := time.Now().UTC()
+		rec := TaskRecord{
+			TaskID:        taskID,
+			Action:        actionName,
+			Params:        params,
+			State:         StateActive,
+			CreatedAt:     now,
+			LastStartedAt: &now,
+		}
+		task := &Task{record: rec}
+
+		h.mu.Lock()
+		delete(h.pending, taskID)
+		h.tasks[taskID] = task
+		h.mu.Unlock()
+
+		w, err := handler.Start(taskID, params, h.workerCBForTask(task))
+		if err != nil {
+			h.mu.Lock()
+			delete(h.tasks, taskID)
+			delete(h.pending, taskID)
+			h.mu.Unlock()
+			return err
+		}
+
+		task.mu.Lock()
+		task.worker = w
+		task.mu.Unlock()
+
+		h.metrics.RecordStart(taskID, actionName)
+		log.Printf("submitted worker task=%s pid=%d action=%s", taskID, w.PID, actionName)
+		started := StartedMessage{Type: "started", TaskID: taskID, PID: w.PID, TS: w.StartedAt}
+		h.BroadcastToSubscribers(taskID, started)
+		h.LogEvent(started)
+		return nil
+	}
+
+	cancelFn := func(reason error) {
+		h.mu.Lock()
+		delete(h.pending, taskID)
+		h.mu.Unlock()
+		h.metrics.RecordDequeued()
+		log.Printf("queued task=%s cancelled: %v", taskID, reason)
+		h.Broadcast(DequeuedMessage{
+			Type:   "dequeued",
+			TaskID: taskID,
+			Reason: reason.Error(),
+			TS:     time.Now().UTC(),
+		})
+	}
+
+	stopFn := func() { h.stopWorker(taskID, true) }
+
+	if h.pool != nil {
+		result, err := h.pool.Acquire(taskID, actionName, false, stopFn, startFn, cancelFn)
+		if err != nil {
+			return fmt.Errorf("pool rejected task: %w", err)
+		}
+		if result == AcquireQueued {
+			h.metrics.RecordEnqueued()
+			poolInfo := h.pool.Info(actionName)
+			h.Broadcast(QueuedMessage{
+				Type:     "queued",
+				TaskID:   taskID,
+				Action:   actionName,
+				Position: poolInfo.QueueDepth,
+				TS:       time.Now().UTC(),
+			})
+		}
+	} else {
+		if err := startFn(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // HandleClient runs the read loop for conn until the connection closes.
 func (h *Hub) HandleClient(conn Conn) {
 	h.AddClient(conn)

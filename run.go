@@ -153,7 +153,16 @@ func RunCLI(version, commit string) {
 		cancel()
 	}()
 
-	// 11. Start transport listening.
+	// 11. Start any ServiceHandler background goroutines.
+	// Each handler implementing ServiceHandler gets RunService called once,
+	// with the hub acting as TaskSubmitter. They run until ctx is cancelled.
+	for _, h := range actions {
+		if sh, ok := h.(ServiceHandler); ok {
+			go sh.RunService(ctx, hub)
+		}
+	}
+
+	// 12. Start transport listening.
 	connChan, err := transport.Listen(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start transport on %s: %v\n", transport.String(), err)
@@ -161,12 +170,12 @@ func RunCLI(version, commit string) {
 	}
 	log.Printf("overseer listening on %s", transport.String())
 
-	// 12. Accept connections until context is cancelled (connChan closes).
+	// 13. Accept connections until context is cancelled (connChan closes).
 	for conn := range connChan {
 		go hub.HandleClient(conn)
 	}
 
-	// 13. Graceful shutdown — pool drain then worker shutdown.
+	// 14. Graceful shutdown — pool drain then worker shutdown.
 	pool.DrainAll()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)

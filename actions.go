@@ -1,11 +1,36 @@
 package overseer
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
 	"github.com/google/cel-go/cel"
 )
+
+// TaskSubmitter allows service handlers to programmatically start tasks on
+// behalf of the hub. Passed to ServiceHandler.RunService at startup.
+type TaskSubmitter interface {
+	// Submit enqueues or starts a task for the named action with the given
+	// params. taskID may be empty — the hub will generate a UUID. Returns an
+	// error if the action is unknown, params are invalid, or the taskID is
+	// already active/pending.
+	Submit(actionName, taskID string, params map[string]string) error
+}
+
+// ServiceHandler is an optional extension for ActionHandlers that need a
+// long-running background goroutine for the server's lifetime (e.g. a
+// directory-scanning daemon that discovers work and submits tasks). If a
+// handler implements ServiceHandler, the hub calls RunService once after
+// startup. RunService should block until ctx is cancelled.
+//
+// Example: a file-conversion driver that watches directories and calls
+// submit.Submit("convert", "", map[string]string{"file": path}) each time a
+// new candidate is found.
+type ServiceHandler interface {
+	ActionHandler
+	RunService(ctx context.Context, submit TaskSubmitter)
+}
 
 // ActionHandler is the core abstraction for all action drivers. Each named
 // action registered in the config must be backed by an ActionHandler.

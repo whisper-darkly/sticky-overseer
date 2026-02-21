@@ -5,66 +5,168 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-make build       # compile to dist/sticky-overseer
-make install     # build + install to /usr/local/bin
-make clean       # remove dist/
-go test -race ./...  # run tests
-go vet ./...     # static analysis
+make build                    # compile to dist/sticky-overseer (from ./cmd/sticky-overseer)
+make install                  # build + install to /usr/local/bin
+make clean                    # remove dist/
+go test -race ./...           # run root package tests
+go test -race ./... ./exec/... # run all tests including exec/ sub-package
+go vet ./...                  # static analysis
 ```
 
 Run directly after building:
 ```bash
-./dist/sticky-overseer                        # default port 8080
-./dist/sticky-overseer -command /path/to/bin  # pin allowed command
-OVERSEER_PORT=9090 ./dist/sticky-overseer
+./dist/sticky-overseer --config ./config.yaml
+./dist/sticky-overseer --list-handlers   # print registered driver types
+OVERSEER_LISTEN=:9090 ./dist/sticky-overseer
 ```
 
 ## Architecture
 
-Single-package Go binary (`package main`) with five files:
+This project is an **importable Go library** (`package overseer`) plus a thin binary wrapper.
 
-- **main.go** — entry point; parses flags/env, opens SQLite DB, sets up IP allowlist, registers `/ws` HTTP handler, handles graceful shutdown
-- **hub.go** — `Hub` manages connected WebSocket clients and persistent `Task` records; dispatches incoming JSON messages (`start`/`list`/`stop`/`reset`/`replay`), broadcasts outbound events, implements retry/restart logic
-- **worker.go** — `Worker` wraps `exec.Cmd`; pipes stdout/stderr via goroutines, stores events in a 100-slot ring buffer, sends SIGTERM on stop (SIGKILL after 5s); callbacks decouple Worker from Hub
-- **store.go** — SQLite persistence via `openDB`; schema v2; WAL mode + 5 s busy timeout; stores task records including retry state and exit timestamps
-- **messages.go** — all JSON struct types for the WebSocket protocol (both directions) plus `RetryPolicy` with duration-string marshalling
+### Package layout
+
+```
+sticky-overseer/          ← package overseer  (importable library)
+  hub.go                  ← Hub: task orchestration, client connections, subscriptions
+  pool.go                 ← PoolManager: concurrency limits, queuing, displacement
+  worker.go               ← Worker: OS-process wrapper + virtual goroutine worker
+  transport.go            ← TCP/Unix socket transports; WebSocket upgrade
+  messages.go             ← all JSON message types (both directions)
+  store.go                ← SQLite: exit_history persistence
+  config.go               ← YAML config loading; ActionConfig, ParamSpec, RetryPolicy
+  actions.go              ← ActionHandler/Factory interfaces, CEL helpers, ServiceHandler
+  run.go                  ← RunCLI() entry point
+  metrics.go              ← in-memory metrics
+  *_test.go               ← package overseer white-box tests
+
+  exec/                   ← package exec  (built-in exec driver; blank-importable)
+    handler.go            ← ExecHandler: runs OS processes with template rendering
+    handler_test.go
+
+  cmd/sticky-overseer/    ← package main  (thin binary wrapper)
+    main.go               ← imports overseer + _ exec; calls overseer.RunCLI()
+
+  docker/                 ← playground HTML (embedded in transport.go)
+  docs/                   ← swagger.json (embedded in transport.go)
+```
 
 ### Key design points
 
-- Tasks are keyed by `task_id` (UUID) in `Hub.tasks`. A `Task` holds a `TaskRecord` (DB state), the current `*Worker`, and an `exitHistory` slice for retry-window tracking.
-- Task states: `active` → running or awaiting restart; `stopped` → intentionally stopped; `errored` → exit threshold exceeded.
-- `RetryPolicy` on a task drives automatic restarts: `restart_delay` (duration), `error_window` (sliding window), `error_threshold` (max exits within window before entering errored state).
-- `Hub.Broadcast` sends to **all** connected clients when a worker produces output or exits — there is no per-client subscription model. Each connection has its own write lock to prevent concurrent writes.
-- The ring buffer (`Worker.events`) holds the last 100 events. `replay` replays from this buffer to a single client; useful for reconnecting clients.
-- `pinnedCommand` restricts `start` commands to a single executable. When set, clients may omit the command field or must match exactly.
-- IP allowlisting is enforced at WebSocket upgrade time. Default: loopback + all local interface subnets. Override with `OVERSEER_TRUSTED_CIDRS`.
-- `OVERSEER_LOG_FILE` opens a JSONL event log; all `started`, `output`, and `exited` events are appended.
-- Concurrency: `Hub.mu` (RWMutex) guards `clients` and `tasks` maps. `Task.mu` (Mutex) guards per-task state. `Worker.mu` (Mutex) guards worker state and events ring buffer.
+**Library / plugin architecture**: Downstream binaries import this library and blank-import
+driver packages to register them at `init()` time (the database driver pattern). The `exec/`
+package is both the built-in driver and the canonical reference implementation.
+
+**ActionHandler** (`actions.go`): the core interface. Per-task drivers implement:
+- `Describe() ActionInfo` — metadata for introspection
+- `Validate(params) error` — param validation (CEL expressions supported)
+- `Start(taskID, params, cb) (*Worker, error)` — launch one worker per task
+
+**ServiceHandler** (`actions.go`): optional extension for drivers that need a background
+goroutine (e.g. a directory scanner). The Hub calls `RunService(ctx, submit)` once at startup.
+`TaskSubmitter.Submit(action, taskID, params)` enqueues work programmatically.
+
+**ActionHandlerFactory** (`actions.go`): registered at `init()` time via
+`overseer.RegisterFactory()`. `BuildActionHandlers()` calls `Create()` for each action in
+the YAML config.
+
+**Worker** (`worker.go`):
+- OS-process workers: `StartWorker(cfg, cb)` — wraps `exec.Cmd`, sets `Setpgid: true`
+  for process-group kill, buffers up to 10MB lines, stores last 100 events in a ring buffer.
+- Virtual (goroutine) workers: `StartVirtualWorker(taskID, fn, cb)` — wraps a Go function;
+  `Stop()` cancels the context passed to `fn`.
+- `WorkerCallbacks{OnOutput, LogEvent, OnExited}` decouple Worker from Hub.
+- `Stop()` sends SIGTERM to process group; escalates to SIGKILL after 5 s.
+
+**Hub** (`hub.go`):
+- `tasks` map (keyed by task_id) holds in-memory `TaskRecord` + current `*Worker`.
+- `subscriptions` map tracks per-connection task subscriptions.
+- `pending` map prevents TOCTOU duplicate-start races.
+- `Hub.Submit(action, taskID, params)` implements `TaskSubmitter` for ServiceHandlers.
+- Broadcast: `Broadcast(msg)` for global events; `BroadcastToSubscribers(taskID, msg)`
+  for task-specific events (output, exited, restarting, errored, started).
+- Auto-subscribes the submitting WebSocket connection to its started task.
+- Exit history is optionally persisted to SQLite (pruned to 24 h).
+
+**PoolManager** (`pool.go`):
+- Per-action concurrency limits with a global default.
+- Queue with configurable size and timeout.
+- Displacement of lower-priority queued items.
+- `Acquire(taskID, action, force, stopFn, startFn, cancelFn)` returns `AcquireRunning`
+  or `AcquireQueued`; `startFn` is called outside pm.mu to avoid lock-order inversions.
+
+**RetryPolicy** (`messages.go`): drives automatic restarts —
+`RestartDelay`, `ErrorWindow` (sliding window), `ErrorThreshold` (max exits within window).
+
+**Task states**: `active` (running or awaiting restart) → `stopped` (intentional) → `errored`
+(exit threshold exceeded).
+
+**CEL validation** (`actions.go`): parameter `validate` fields and output `condition` fields
+are compiled at `Create()` time using Google CEL. Parameter expr variable: `value`.
+Output filter expr variables: `output.stream`, `output.data`, `output.json`.
+
+**Output filtering** (`exec/handler.go`): per-stream CEL conditions on stdout/stderr.
+Non-matching lines are dropped before reaching WebSocket clients.
+
+**Template rendering** (`exec/handler.go`): entrypoint and command args support
+`[[ ]]`-delimited Go templates (chosen to avoid conflicts with shell `${}` and JSON `{}`).
 
 ### WebSocket protocol
 
-All messages are JSON. Client→server messages share `IncomingMessage`; server→client messages are typed individually.
+All messages are JSON. `IncomingMessage` (client→server) dispatches on `type`.
 
-**Client → Server** (`type` field selects handler):
+**Client → Server**:
 
 | type | fields | notes |
 |------|--------|-------|
-| `start` | `task_id`, `command`, `args[]`, `retry_policy`, `id` | `command` may be omitted when pinned; `task_id` auto-generated if absent |
-| `list` | `since` (RFC3339), `id` | filters tasks by last activity time |
-| `stop` | `task_id`, `id` | sends SIGTERM to worker; SIGKILL after 5 s |
-| `reset` | `task_id`, `id` | clears errored state and restarts worker |
-| `replay` | `task_id`, `since` (RFC3339), `id` | replays ring buffer to caller only |
+| `start` | `action`, `task_id`, `params`, `retry_policy`, `force`, `id` | `task_id` auto-generated if absent |
+| `stop` | `task_id`, `id` | SIGTERM → SIGKILL after 5 s |
+| `reset` | `task_id`, `id` | clears errored state, restarts |
+| `list` | `since` (RFC3339), `id` | filtered task list |
+| `replay` | `task_id`, `since`, `id` | ring-buffer replay to caller |
+| `subscribe` | `task_id` | subscribe to task events |
+| `unsubscribe` | `task_id` | unsubscribe |
+| `describe` | `id` | list registered actions |
+| `pool_info` | `action`, `id` | pool state |
+| `set_pool` | `action`, `size`, `id` | resize pool |
+| `purge` | `action`, `id` | drain queue |
+| `metrics` | `action`, `task_id`, `id` | in-memory metrics |
 
-**Server → Client** (`type` field):
+**Server → Client**:
 
 | type | fields |
 |------|--------|
 | `started` | `task_id`, `pid`, `restart_of`, `ts`, `id` |
 | `tasks` | `tasks[]` (TaskInfo), `id` |
-| `output` | `task_id`, `pid`, `stream` (stdout/stderr), `data`, `ts` |
+| `output` | `task_id`, `pid`, `stream`, `data`, `seq`, `ts` |
 | `exited` | `task_id`, `pid`, `exit_code`, `intentional`, `ts` |
 | `restarting` | `task_id`, `pid`, `restart_delay`, `attempt`, `ts` |
 | `errored` | `task_id`, `pid`, `exit_count`, `ts` |
+| `queued` | `task_id`, `action`, `position`, `ts`, `id` |
+| `dequeued` | `task_id`, `reason`, `ts` |
+| `actions` | `actions[]` (ActionInfo), `id` |
+| `pool_info` | pool state, `id` |
+| `metrics` | metrics data, `id` |
 | `error` | `message`, `id` |
 
-The optional `id` field in client messages is echoed back in the response, allowing request/response correlation.
+`seq` is a per-task monotonic counter on each output event.
+Reconnecting clients can detect ring-buffer gaps by comparing `seq` values.
+
+The optional `id` field in client messages is echoed back in responses for request/response correlation.
+
+### Consumer pattern (how downstream binaries use this library)
+
+```go
+package main
+
+import (
+    overseer "github.com/whisper-darkly/sticky-overseer/v2"
+    _ "github.com/whisper-darkly/sticky-overseer/v2/exec"  // built-in handler
+    _ "myorg/drivers/converter"                             // custom handler
+)
+
+var version = "dev"
+var commit  = "unknown"
+
+func main() { overseer.RunCLI(version, commit) }
+```
