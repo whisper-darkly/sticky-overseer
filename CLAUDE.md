@@ -33,7 +33,7 @@ sticky-overseer/          ← package overseer  (importable library)
   worker.go               ← Worker: OS-process wrapper + virtual goroutine worker
   transport.go            ← TCP/Unix socket transports; WebSocket upgrade
   messages.go             ← all JSON message types (both directions)
-  store.go                ← SQLite: exit_history persistence
+  store.go                ← SQLite: OpenDB helper (WAL mode); no persistent tables
   config.go               ← YAML config loading; ActionConfig, ParamSpec, RetryPolicy
   actions.go              ← ActionHandler/Factory interfaces, CEL helpers, ServiceHandler
   run.go                  ← RunCLI() entry point
@@ -86,7 +86,7 @@ the YAML config.
 - Broadcast: `Broadcast(msg)` for global events; `BroadcastToSubscribers(taskID, msg)`
   for task-specific events (output, exited, restarting, errored, started).
 - Auto-subscribes the submitting WebSocket connection to its started task.
-- Exit history is optionally persisted to SQLite (pruned to 24 h).
+- Exit history is tracked in-memory only; resets on overseer restart by design.
 
 **PoolManager** (`pool.go`):
 - Per-action concurrency limits with a global default.

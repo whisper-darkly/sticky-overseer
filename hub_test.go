@@ -122,17 +122,12 @@ func (h *testFalseHandler) Start(taskID string, params map[string]string, cb Wor
 // The hub is wired to an HTTP test server so tests can dial real WebSocket connections.
 func newHubEnv(t *testing.T, actions map[string]ActionHandler) *hubTestEnv {
 	t.Helper()
-	db, err := OpenDB(":memory:")
-	if err != nil {
-		t.Fatalf("OpenDB: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
 
 	if actions == nil {
 		actions = defaultTestActions()
 	}
 
-	hub := NewHub(HubConfig{DB: db, Actions: actions})
+	hub := NewHub(HubConfig{Actions: actions})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -998,13 +993,7 @@ func TestPoolInfo_NoPool(t *testing.T) {
 
 // TestBroadcast_AllClients verifies Broadcast sends to all connected clients.
 func TestBroadcast_AllClients(t *testing.T) {
-	db, err := OpenDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	hub := NewHub(HubConfig{DB: db, Actions: defaultTestActions()})
+	hub := NewHub(HubConfig{Actions: defaultTestActions()})
 
 	// Create 3 mock connections
 	const numClients = 3
@@ -1681,13 +1670,7 @@ func TestSeqNumbersResetPerTask(t *testing.T) {
 // TestStdioConn_HubIntegration verifies that Hub can handle a stdioConn as a Conn.
 // This tests the STDIO transport pathway without a real WebSocket.
 func TestStdioConn_HubIntegration(t *testing.T) {
-	db, err := OpenDB(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	hub := NewHub(HubConfig{DB: db, Actions: defaultTestActions()})
+	hub := NewHub(HubConfig{Actions: defaultTestActions()})
 
 	// Create in-memory pipes to simulate stdin/stdout.
 	// clientR reads hub responses; clientW sends client messages.

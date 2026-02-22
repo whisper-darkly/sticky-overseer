@@ -75,16 +75,7 @@ func RunCLI(version, commit string) {
 		cfg.DB = dbEnv
 	}
 
-	// 3. Open database (includes v2→v3 migration).
-	db, err := OpenDB(cfg.DB)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to open database %s: %v\n", cfg.DB, err)
-		os.Exit(1)
-	}
-	defer db.Close()
-	log.Printf("database: %s", cfg.DB)
-
-	// 4. Build action handlers from config.
+	// 3. Build action handlers from config.
 	actions, err := BuildActionHandlers(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build action handlers: %v\n", err)
@@ -134,7 +125,6 @@ func RunCLI(version, commit string) {
 
 	// 9. Create Hub.
 	hub := NewHub(HubConfig{
-		DB:          db,
 		EventLog:    eventLog,
 		Actions:     actions,
 		Pool:        pool,
@@ -191,7 +181,6 @@ func RunCLI(version, commit string) {
 		log.Printf("hub shutdown: %v", err)
 	}
 
-	// DB is closed by deferred db.Close() above.
 	log.Println("shutdown complete")
 }
 

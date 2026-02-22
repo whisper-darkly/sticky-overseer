@@ -509,8 +509,8 @@ State transitions:
 
 Duration strings use Go format: `"5s"`, `"1m30s"`, `"2h"`.
 
-Exit history within `error_window` is persisted to SQLite (when `db` is configured) so
-thresholds survive overseer restarts.
+Exit history within `error_window` is tracked in-memory only and resets on overseer
+restart. This is intentional — a restart is a valid way to clear runaway tasks.
 
 ---
 

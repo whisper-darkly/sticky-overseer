@@ -3,7 +3,6 @@ package overseer
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +17,6 @@ import (
 
 // HubConfig holds all options for creating a Hub.
 type HubConfig struct {
-	DB          *sql.DB                  // reserved for future exit-history persistence (job 1370); not used for task CRUD
 	EventLog    io.Writer                // optional; nil = no log
 	Actions     map[string]ActionHandler // built once at startup; immutable
 	Pool        *PoolManager             // manages concurrency + queue
@@ -60,7 +58,6 @@ type Hub struct {
 	pending       map[string]struct{}            // task IDs currently being started; prevents TOCTOU duplicate starts; protected by h.mu
 	actions       map[string]ActionHandler       // immutable after startup
 	pool          *PoolManager                   // manages concurrency + queue
-	db            *sql.DB                        // optional; used for exit_history persistence (nil = no persistence)
 	metrics       *Metrics                       // in-memory metrics registry; never nil after NewHub
 	eventLog      *json.Encoder
 	eventLogMu    sync.Mutex // serialises concurrent Encode calls on eventLog
@@ -71,8 +68,6 @@ type Hub struct {
 
 // NewHub creates a Hub with an empty in-memory task map.
 // Tasks are not persisted across restarts — each startup begins fresh.
-// If cfg.DB is non-nil, exit_history records are persisted to SQLite and a
-// background pruner goroutine is started to prevent unbounded table growth.
 func NewHub(cfg HubConfig) *Hub {
 	h := &Hub{
 		clients:       make(map[Conn]struct{}),
@@ -81,7 +76,6 @@ func NewHub(cfg HubConfig) *Hub {
 		pending:       make(map[string]struct{}),
 		actions:       cfg.Actions,
 		pool:          cfg.Pool,
-		db:            cfg.DB,
 		metrics:       NewMetrics(),
 		shutdownCh:    make(chan struct{}),
 		version:       cfg.Version,
@@ -89,26 +83,6 @@ func NewHub(cfg HubConfig) *Hub {
 	if cfg.EventLog != nil {
 		h.eventLog = json.NewEncoder(cfg.EventLog)
 	}
-
-	// Start background exit-history pruner when a DB is configured.
-	// Prunes records older than 24 hours every hour to prevent table bloat.
-	if h.db != nil {
-		go func() {
-			ticker := time.NewTicker(1 * time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					if err := pruneExitHistory(h.db, time.Now().Add(-24*time.Hour)); err != nil {
-						log.Printf("exit_history: prune failed: %v", err)
-					}
-				case <-h.shutdownCh:
-					return
-				}
-			}
-		}()
-	}
-
 	return h
 }
 
@@ -646,19 +620,7 @@ func (h *Hub) handleStart(conn Conn, msg IncomingMessage) {
 			LastStartedAt: &now,
 		}
 
-		// Load recent exit history from DB for retry-window tracking.
-		// This ensures the ErrorWindow check works correctly across overseer restarts.
 		task := &Task{record: rec}
-		if h.db != nil && retryPolicy != nil && retryPolicy.ErrorWindow > 0 {
-			since := now.Add(-retryPolicy.ErrorWindow)
-			history, err := loadExitHistory(h.db, action, since)
-			if err != nil {
-				log.Printf("exit_history: load failed action=%s: %v", action, err)
-			} else if len(history) > 0 {
-				task.exitHistory = history
-				task.record.ExitCount = len(history)
-			}
-		}
 
 		// Atomically transition from pending → active: remove from pending,
 		// register in tasks. This must be a single h.mu.Lock so the task is
@@ -1122,13 +1084,6 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 
 	if intentional || task.record.State == StateStopped {
 		return
-	}
-
-	// Persist non-intentional exit for cross-restart retry-window tracking.
-	if h.db != nil {
-		if err := recordExit(h.db, task.record.TaskID, task.record.Action, now); err != nil {
-			log.Printf("exit_history: record failed task=%s: %v", task.record.TaskID, err)
-		}
 	}
 
 	rp := task.record.RetryPolicy
