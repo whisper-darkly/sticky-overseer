@@ -28,54 +28,54 @@ type swaggerTag struct {
 	Description string `json:"description,omitempty"`
 }
 
-// swaggerPathItem holds the standard HTTP methods plus the custom "ws" key.
-// The "ws" value is a connection-endpoint descriptor; sticky-bb consumes it
-// while SwaggerUI silently ignores the unknown method.
+// swaggerPathItem holds HTTP methods plus the custom "ws" key. sticky-bb reads
+// the "ws" value; SwaggerUI ignores the unknown method.
 type swaggerPathItem struct {
 	Post *swaggerOperation   `json:"post,omitempty"`
 	WS   *swaggerWSOperation `json:"ws,omitempty"`
 }
 
-// swaggerWSOperation describes a WebSocket connection endpoint and all of the
-// commands that can be sent over it.
+// swaggerWSOperation describes a WebSocket connection endpoint and the commands
+// that can be sent over it. Protocol-specific conventions (type discriminator
+// names, correlation IDs, etc.) belong in per-command parameter defaults, not
+// in this descriptor.
 type swaggerWSOperation struct {
-	Summary          string             `json:"summary,omitempty"`
-	Description      string             `json:"description,omitempty"`
-	TypeField        string             `json:"type_field,omitempty"`
-	CorrelationField string             `json:"correlation_field,omitempty"`
-	Commands         []swaggerWSCommand `json:"commands,omitempty"`
+	Summary     string             `json:"summary,omitempty"`
+	Description string             `json:"description,omitempty"`
+	Commands    []swaggerWSCommand `json:"commands,omitempty"`
 }
 
-// swaggerWSCommand describes a single message that can be sent over a WebSocket
-// connection. It is intentionally a separate, simpler type from swaggerOperation:
-// there are no HTTP concerns (no "in", no consumes), and "type" maps directly to
-// the semantic ws type rather than a restricted OAS type.
+// swaggerWSCommand describes one message that can be sent over a WebSocket
+// connection. Parameters include both visible fields (shown in the UI) and
+// hidden fields (always sent with their default value, not shown to the user).
+// This lets server-specific protocol conventions — like a "type" discriminator
+// or an "action" name — live entirely in the spec rather than in sticky-bb.
 type swaggerWSCommand struct {
-	Message     string           `json:"message"`
 	Summary     string           `json:"summary,omitempty"`
 	Description string           `json:"description,omitempty"`
 	OperationID string           `json:"operationId,omitempty"`
 	Tags        []string         `json:"tags,omitempty"`
-	Action      string           `json:"action,omitempty"`    // inject as top-level "action" field
-	ParamsKey   string           `json:"params_key,omitempty"` // wrap params under this key
+	ParamsKey   string           `json:"params_key,omitempty"` // nest visible params under this key
 	Parameters  []swaggerWSParam `json:"parameters,omitempty"`
 
-	// Action discovery metadata (informational; used by tooling).
+	// Action discovery metadata (informational).
 	XActionType string       `json:"x-action-type,omitempty"`
 	XTaskPool   *PoolConfig  `json:"x-task-pool,omitempty"`
 	XRetry      *RetryPolicy `json:"x-retry,omitempty"`
 	XDedupeKey  []string     `json:"x-dedupe-key,omitempty"`
 }
 
-// swaggerWSParam describes a parameter for a WebSocket command. Unlike
-// swaggerParameter there is no "in" field — all params are message fields.
-// "type" uses the semantic WS type vocabulary directly: string, integer,
-// boolean, object, uuid, timestamp, duration.
+// swaggerWSParam describes one field in a WebSocket command message. Hidden
+// params are injected into the assembled message at the top level using their
+// default value; visible params are rendered as form inputs.
+// Type uses the semantic WS vocabulary: string, integer, boolean, object,
+// uuid, timestamp, duration.
 type swaggerWSParam struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Type        string `json:"type,omitempty"`
 	Required    bool   `json:"required,omitempty"`
+	Hidden      bool   `json:"hidden,omitempty"`
 	Default     any    `json:"default,omitempty"`
 	Validate    string `json:"validate,omitempty"`
 }
@@ -107,11 +107,11 @@ type swaggerResponse struct {
 
 // BuildOpenAPISpec dynamically generates a Swagger 2.0 JSON document.
 //
-// The /ws path item uses the custom "ws" key (not a valid HTTP method) to
-// describe the WebSocket endpoint and its commands. All WS commands — both
-// standard protocol commands and registered action starts — are nested as a
-// "commands" array inside that single path item. sticky-bb consumes this
-// structure; SwaggerUI ignores the unknown method.
+// The /ws path item uses the custom "ws" key to describe the WebSocket
+// endpoint and all of its commands as a nested commands array. Protocol
+// conventions such as the type discriminator and action routing are expressed
+// as hidden parameters with default values — sticky-bb has no knowledge of
+// overseer-specific field names.
 func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 	spec := swaggerSpec{
 		Swagger: "2.0",
@@ -139,17 +139,14 @@ func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 		actionTags...,
 	)
 
-	// Build the /ws path item: one connection endpoint, all commands nested inside.
 	cmds := buildWSProtocolCommands()
 	for _, info := range infos {
 		cmds = append(cmds, buildWSActionCommand(info))
 	}
 	spec.Paths["/ws"] = swaggerPathItem{
 		WS: &swaggerWSOperation{
-			Summary:          "WebSocket",
-			TypeField:        "type",
-			CorrelationField: "id",
-			Commands:         cmds,
+			Summary:  "WebSocket",
+			Commands: cmds,
 		},
 	}
 
@@ -161,116 +158,127 @@ func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 	return data
 }
 
+// hidden returns a parameter that is always injected at top-level with its
+// default value and never shown in the UI.
+func hidden(name string, val any) swaggerWSParam {
+	return swaggerWSParam{Name: name, Default: val, Hidden: true}
+}
+
+// wsParam returns a visible parameter with the given semantic type.
+func wsParam(name, description, typ string, required bool) swaggerWSParam {
+	return swaggerWSParam{Name: name, Description: description, Type: typ, Required: required}
+}
+
 // buildWSProtocolCommands returns the fixed set of standard protocol commands.
+// Each command carries a hidden "type" parameter that sticky-bb injects into
+// every assembled message — this is sticky-overseer's protocol convention, not
+// sticky-bb's.
 func buildWSProtocolCommands() []swaggerWSCommand {
-	p := func(name, desc, typ string, required bool) swaggerWSParam {
-		return swaggerWSParam{Name: name, Description: desc, Type: typ, Required: required}
-	}
-	actionOpt := p("action", "Action name (omit for all actions)", "string", false)
-	taskID := p("task_id", "Task identifier", "uuid", true)
+	id := wsParam("id", "Correlation ID (echoed in response)", "string", false)
+	actionOpt := wsParam("action", "Action name (omit for all actions)", "string", false)
+	taskID := wsParam("task_id", "Task identifier", "uuid", true)
 
 	return []swaggerWSCommand{
 		{
-			Message: "list", OperationID: "ws-list",
-			Summary:     "List tasks",
+			OperationID: "ws-list", Summary: "List tasks",
 			Description: "List all known tasks, optionally filtered by activity time",
-			Parameters:  []swaggerWSParam{p("since", "Only return tasks active after this time (RFC3339)", "timestamp", false)},
+			Parameters: []swaggerWSParam{
+				hidden("type", "list"), id,
+				wsParam("since", "Only return tasks active after this time (RFC3339)", "timestamp", false),
+			},
 		},
 		{
-			Message: "stop", OperationID: "ws-stop",
-			Summary:    "Stop task",
+			OperationID: "ws-stop", Summary: "Stop task",
 			Description: "Stop a running or queued task",
-			Parameters: []swaggerWSParam{taskID},
+			Parameters:  []swaggerWSParam{hidden("type", "stop"), id, taskID},
 		},
 		{
-			Message: "reset", OperationID: "ws-reset",
-			Summary:    "Reset task",
+			OperationID: "ws-reset", Summary: "Reset task",
 			Description: "Restart an errored task, clearing its exit history",
-			Parameters: []swaggerWSParam{taskID},
+			Parameters:  []swaggerWSParam{hidden("type", "reset"), id, taskID},
 		},
 		{
-			Message: "replay", OperationID: "ws-replay",
-			Summary:    "Replay task output",
+			OperationID: "ws-replay", Summary: "Replay task output",
 			Description: "Replay buffered output events for a task",
 			Parameters: []swaggerWSParam{
-				taskID,
-				p("since", "Replay only output after this time (RFC3339)", "timestamp", false),
+				hidden("type", "replay"), id, taskID,
+				wsParam("since", "Replay only output after this time (RFC3339)", "timestamp", false),
 			},
 		},
 		{
-			Message: "describe", OperationID: "ws-describe",
-			Summary:    "Describe actions",
+			OperationID: "ws-describe", Summary: "Describe actions",
 			Description: "Describe available actions and their parameter schemas",
-			Parameters: []swaggerWSParam{actionOpt},
+			Parameters:  []swaggerWSParam{hidden("type", "describe"), id, actionOpt},
 		},
 		{
-			Message: "pool_info", OperationID: "ws-pool-info",
-			Summary:    "Pool info",
+			OperationID: "ws-pool-info", Summary: "Pool info",
 			Description: "Query current pool state for an action or globally",
-			Parameters: []swaggerWSParam{actionOpt},
+			Parameters:  []swaggerWSParam{hidden("type", "pool_info"), id, actionOpt},
 		},
 		{
-			Message: "purge", OperationID: "ws-purge",
-			Summary:    "Purge queue",
+			OperationID: "ws-purge", Summary: "Purge queue",
 			Description: "Remove all queued tasks for an action (or all actions)",
-			Parameters: []swaggerWSParam{actionOpt},
+			Parameters:  []swaggerWSParam{hidden("type", "purge"), id, actionOpt},
 		},
 		{
-			Message: "set_pool", OperationID: "ws-set-pool",
-			Summary:    "Set pool limits",
+			OperationID: "ws-set-pool", Summary: "Set pool limits",
 			Description: "Dynamically update pool limits and queue configuration",
 			Parameters: []swaggerWSParam{
-				p("action", "Action name (omit for global)", "string", false),
-				p("limit", "New concurrency limit (0=unlimited)", "integer", false),
-				p("queue_size", "New queue size limit", "integer", false),
-				p("excess", "How to handle tasks exceeding the new limit", "object", false),
+				hidden("type", "set_pool"), id,
+				wsParam("action", "Action name (omit for global)", "string", false),
+				wsParam("limit", "New concurrency limit (0=unlimited)", "integer", false),
+				wsParam("queue_size", "New queue size limit", "integer", false),
+				wsParam("excess", "How to handle tasks exceeding the new limit", "object", false),
 			},
 		},
 		{
-			Message: "subscribe", OperationID: "ws-subscribe",
-			Summary:    "Subscribe to task",
+			OperationID: "ws-subscribe", Summary: "Subscribe to task",
 			Description: "Subscribe to task-specific broadcast events",
-			Parameters: []swaggerWSParam{taskID},
+			Parameters:  []swaggerWSParam{hidden("type", "subscribe"), id, taskID},
 		},
 		{
-			Message: "unsubscribe", OperationID: "ws-unsubscribe",
-			Summary:    "Unsubscribe from task",
+			OperationID: "ws-unsubscribe", Summary: "Unsubscribe from task",
 			Description: "Unsubscribe from task-specific broadcast events",
-			Parameters: []swaggerWSParam{taskID},
+			Parameters:  []swaggerWSParam{hidden("type", "unsubscribe"), id, taskID},
 		},
 		{
-			Message: "metrics", OperationID: "ws-metrics",
-			Summary:    "Get metrics",
+			OperationID: "ws-metrics", Summary: "Get metrics",
 			Description: "Query metrics at global, per-action, or per-task granularity",
 			Parameters: []swaggerWSParam{
-				p("action", "Action name for per-action metrics (mutually exclusive with task_id)", "string", false),
-				p("task_id", "Task ID for per-task metrics (mutually exclusive with action)", "uuid", false),
+				hidden("type", "metrics"), id,
+				wsParam("action", "Action name for per-action metrics (mutually exclusive with task_id)", "string", false),
+				wsParam("task_id", "Task ID for per-task metrics (mutually exclusive with action)", "uuid", false),
 			},
 		},
 		{
-			Message: "manifest", OperationID: "ws-manifest",
-			Summary:    "Get manifest",
+			OperationID: "ws-manifest", Summary: "Get manifest",
 			Description: "Request the full WS Manifest document describing this protocol",
+			Parameters:  []swaggerWSParam{hidden("type", "manifest"), id},
 		},
 	}
 }
 
-// buildWSActionCommand builds a WS command descriptor for a registered action's
-// start operation.
+// buildWSActionCommand builds a WS command for a registered action's start
+// operation. The "type" and "action" protocol fields are hidden parameters so
+// sticky-bb injects them without any overseer-specific logic.
 func buildWSActionCommand(info ActionInfo) swaggerWSCommand {
 	summary := "Start " + info.Name + " task"
 	if info.Description != "" {
 		summary = info.Description
 	}
 
+	params := []swaggerWSParam{
+		hidden("type", "start"),
+		hidden("action", info.Name),
+	}
+	params = append(params, buildWSParams(info.Params)...)
+
 	cmd := swaggerWSCommand{
-		Message:     "start",
 		OperationID: "start-" + info.Name,
 		Summary:     summary,
 		Tags:        []string{info.Name},
-		Action:      info.Name,
 		ParamsKey:   "params",
-		Parameters:  buildWSParams(info.Params),
+		Parameters:  params,
 		XActionType: info.Type,
 	}
 	if info.TaskPool.Limit > 0 || info.TaskPool.Queue != nil {

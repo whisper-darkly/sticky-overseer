@@ -56,22 +56,18 @@ func TestBuildOpenAPISpec_structure(t *testing.T) {
 	}
 
 	wsOp := wsOpFromSpec(t, spec)
-	if wsOp["type_field"] != "type" {
-		t.Errorf("ws.type_field = %v; want type", wsOp["type_field"])
-	}
-	if wsOp["correlation_field"] != "id" {
-		t.Errorf("ws.correlation_field = %v; want id", wsOp["correlation_field"])
+
+	// No protocol-specific fields on the connection descriptor
+	for _, field := range []string{"type_field", "correlation_field", "x-websocket-endpoints"} {
+		if _, exists := wsOp[field]; exists {
+			t.Errorf("unexpected field %q on ws operation descriptor", field)
+		}
 	}
 
 	// 12 standard protocol commands when no actions registered
 	cmds, _ := wsOp["commands"].([]any)
 	if len(cmds) != 12 {
 		t.Errorf("expected 12 standard commands for nil actions, got %d", len(cmds))
-	}
-
-	// No x-websocket-endpoints root extension
-	if _, exists := spec["x-websocket-endpoints"]; exists {
-		t.Error("unexpected x-websocket-endpoints in spec")
 	}
 }
 
@@ -111,11 +107,11 @@ func TestBuildOpenAPISpec_actions(t *testing.T) {
 		t.Fatalf("expected 14 commands (12 standard + 2 actions), got %d", len(cmds))
 	}
 
-	// Find the greet command
+	// Find the greet command by operationId
 	var greetCmd map[string]any
 	for _, c := range cmds {
 		cmd := c.(map[string]any)
-		if cmd["action"] == "greet" {
+		if cmd["operationId"] == "start-greet" {
 			greetCmd = cmd
 			break
 		}
@@ -124,12 +120,6 @@ func TestBuildOpenAPISpec_actions(t *testing.T) {
 		t.Fatal("greet action command not found in commands")
 	}
 
-	if greetCmd["message"] != "start" {
-		t.Errorf("greet message = %v; want start", greetCmd["message"])
-	}
-	if greetCmd["operationId"] != "start-greet" {
-		t.Errorf("greet operationId = %v; want start-greet", greetCmd["operationId"])
-	}
 	if greetCmd["params_key"] != "params" {
 		t.Errorf("greet params_key = %v; want params", greetCmd["params_key"])
 	}
@@ -137,43 +127,49 @@ func TestBuildOpenAPISpec_actions(t *testing.T) {
 		t.Errorf("greet x-action-type = %v; want exec", greetCmd["x-action-type"])
 	}
 
+	// Parameters: hidden type + hidden action + name (required) + suffix (optional) = 4
 	rawParams, _ := greetCmd["parameters"].([]any)
-	if len(rawParams) != 2 {
-		t.Fatalf("greet: expected 2 parameters, got %d", len(rawParams))
+	if len(rawParams) != 4 {
+		t.Fatalf("greet: expected 4 parameters (2 hidden + 2 visible), got %d", len(rawParams))
 	}
 
-	// Required param first
+	// First two are hidden (type, action)
 	p0, _ := rawParams[0].(map[string]any)
-	if p0["name"] != "name" {
-		t.Errorf("first param = %v; want name", p0["name"])
+	if p0["name"] != "type" || p0["hidden"] != true {
+		t.Errorf("first param should be hidden type, got %v", p0)
 	}
-	if p0["required"] != true {
-		t.Errorf("name required = %v; want true", p0["required"])
+	if p0["default"] != "start" {
+		t.Errorf("hidden type default = %v; want start", p0["default"])
 	}
-	// Type is "string" (default from ParamSpec)
-	if p0["type"] != "string" {
-		t.Errorf("name type = %v; want string", p0["type"])
-	}
-
 	p1, _ := rawParams[1].(map[string]any)
-	if p1["name"] != "suffix" {
-		t.Errorf("second param = %v; want suffix", p1["name"])
+	if p1["name"] != "action" || p1["hidden"] != true {
+		t.Errorf("second param should be hidden action, got %v", p1)
 	}
-	if p1["required"] == true {
-		t.Errorf("suffix required = true; want false/omitted")
-	}
-	if p1["default"] != defVal {
-		t.Errorf("suffix default = %v; want %q", p1["default"], defVal)
-	}
-	if validate, _ := p1["validate"].(string); !strings.Contains(validate, "value") {
-		t.Errorf("suffix validate = %v; expected CEL expression", p1["validate"])
+	if p1["default"] != "greet" {
+		t.Errorf("hidden action default = %v; want greet", p1["default"])
 	}
 
-	// echo command: no parameters
+	// Visible params: required "name" then optional "suffix"
+	p2, _ := rawParams[2].(map[string]any)
+	if p2["name"] != "name" || p2["required"] != true {
+		t.Errorf("third param should be required name, got %v", p2)
+	}
+	p3, _ := rawParams[3].(map[string]any)
+	if p3["name"] != "suffix" || p3["required"] == true {
+		t.Errorf("fourth param should be optional suffix, got %v", p3)
+	}
+	if p3["default"] != defVal {
+		t.Errorf("suffix default = %v; want %q", p3["default"], defVal)
+	}
+	if validate, _ := p3["validate"].(string); !strings.Contains(validate, "value") {
+		t.Errorf("suffix validate = %v; expected CEL expression", p3["validate"])
+	}
+
+	// echo command: only the 2 hidden params (type + action), no visible params
 	var echoCmd map[string]any
 	for _, c := range cmds {
 		cmd := c.(map[string]any)
-		if cmd["action"] == "echo" {
+		if cmd["operationId"] == "start-echo" {
 			echoCmd = cmd
 			break
 		}
@@ -181,8 +177,9 @@ func TestBuildOpenAPISpec_actions(t *testing.T) {
 	if echoCmd == nil {
 		t.Fatal("echo action command not found")
 	}
-	if echoCmd["parameters"] != nil {
-		t.Errorf("echo should have no parameters, got %v", echoCmd["parameters"])
+	echoParams, _ := echoCmd["parameters"].([]any)
+	if len(echoParams) != 2 {
+		t.Errorf("echo should have 2 hidden params (type+action), got %d", len(echoParams))
 	}
 }
 
@@ -235,7 +232,7 @@ func TestBuildOpenAPISpec_extensions(t *testing.T) {
 	var workerCmd map[string]any
 	for _, c := range cmds {
 		cmd := c.(map[string]any)
-		if cmd["action"] == "worker" {
+		if cmd["operationId"] == "start-worker" {
 			workerCmd = cmd
 			break
 		}
@@ -267,51 +264,63 @@ func TestBuildOpenAPISpec_wsCommands(t *testing.T) {
 	wsOp := wsOpFromSpec(t, spec)
 	cmds, _ := wsOp["commands"].([]any)
 
-	// Index commands by message name
-	byMessage := map[string]map[string]any{}
+	// Index commands by the hidden "type" param's default value.
+	// Every protocol command carries a hidden(\"type\", <value>) param.
+	byType := map[string]map[string]any{}
 	for _, c := range cmds {
 		cmd := c.(map[string]any)
-		if msg, _ := cmd["message"].(string); msg != "" {
-			byMessage[msg] = cmd
+		for _, p := range cmd["parameters"].([]any) {
+			pm := p.(map[string]any)
+			if pm["name"] == "type" && pm["hidden"] == true {
+				if typVal, _ := pm["default"].(string); typVal != "" {
+					byType[typVal] = cmd
+				}
+				break
+			}
 		}
 	}
 
-	expectedMessages := []string{
+	expectedTypes := []string{
 		"list", "stop", "reset", "replay", "describe",
 		"pool_info", "purge", "set_pool", "subscribe",
 		"unsubscribe", "metrics", "manifest",
 	}
-	for _, msg := range expectedMessages {
-		if _, ok := byMessage[msg]; !ok {
-			t.Errorf("missing command with message=%q", msg)
+	for _, typ := range expectedTypes {
+		if _, ok := byType[typ]; !ok {
+			t.Errorf("missing command with hidden type=%q", typ)
 		}
 	}
 
-	// stop requires task_id (uuid)
-	stopCmd := byMessage["stop"]
+	// stop: has required task_id (uuid) among its params
+	stopCmd := byType["stop"]
 	stopParams, _ := stopCmd["parameters"].([]any)
-	if len(stopParams) != 1 {
-		t.Fatalf("stop: expected 1 param, got %d", len(stopParams))
+	var taskIDParam map[string]any
+	for _, p := range stopParams {
+		pm := p.(map[string]any)
+		if pm["name"] == "task_id" {
+			taskIDParam = pm
+			break
+		}
 	}
-	p0, _ := stopParams[0].(map[string]any)
-	if p0["name"] != "task_id" {
-		t.Errorf("stop param name = %v; want task_id", p0["name"])
+	if taskIDParam == nil {
+		t.Fatal("stop: task_id param not found")
 	}
-	if p0["required"] != true {
-		t.Errorf("stop task_id required = %v; want true", p0["required"])
+	if taskIDParam["required"] != true {
+		t.Errorf("stop task_id required = %v; want true", taskIDParam["required"])
 	}
-	if p0["type"] != "uuid" {
-		t.Errorf("stop task_id type = %v; want uuid", p0["type"])
+	if taskIDParam["type"] != "uuid" {
+		t.Errorf("stop task_id type = %v; want uuid", taskIDParam["type"])
 	}
 
-	// manifest has no parameters
-	manifestCmd := byMessage["manifest"]
-	if manifestCmd["parameters"] != nil {
-		t.Errorf("manifest should have no parameters, got %v", manifestCmd["parameters"])
+	// manifest: only hidden type + optional id (2 params, no action-specific visible params)
+	manifestCmd := byType["manifest"]
+	manifestParams, _ := manifestCmd["parameters"].([]any)
+	if len(manifestParams) != 2 {
+		t.Errorf("manifest: expected 2 params (hidden type + id), got %d", len(manifestParams))
 	}
 
 	// set_pool has object-typed excess param
-	setPoolCmd := byMessage["set_pool"]
+	setPoolCmd := byType["set_pool"]
 	setPoolParams, _ := setPoolCmd["parameters"].([]any)
 	var excessParam map[string]any
 	for _, p := range setPoolParams {
