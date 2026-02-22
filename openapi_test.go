@@ -195,17 +195,9 @@ func TestBuildOpenAPISpec_tags(t *testing.T) {
 
 	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0"))
 
-	tags, _ := spec["tags"].([]any)
-	if len(tags) != 3 {
-		t.Fatalf("expected 3 tags (ws-commands + 2 actions), got %d", len(tags))
-	}
-	first, _ := tags[0].(map[string]any)
-	if first["name"] != "ws-commands" {
-		t.Errorf("first tag = %v; want ws-commands", first["name"])
-	}
-	second, _ := tags[1].(map[string]any)
-	if second["name"] != "alpha" {
-		t.Errorf("second tag = %v; want alpha", second["name"])
+	// Tags are no longer emitted — the spec should have no top-level tags array.
+	if _, exists := spec["tags"]; exists {
+		t.Errorf("expected no top-level tags, but found them: %v", spec["tags"])
 	}
 }
 

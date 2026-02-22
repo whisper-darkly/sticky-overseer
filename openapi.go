@@ -13,7 +13,6 @@ type swaggerSpec struct {
 	BasePath string                     `json:"basePath,omitempty"`
 	Consumes []string                   `json:"consumes,omitempty"`
 	Produces []string                   `json:"produces,omitempty"`
-	Tags     []swaggerTag               `json:"tags,omitempty"`
 	Paths    map[string]swaggerPathItem `json:"paths"`
 }
 
@@ -21,11 +20,6 @@ type swaggerInfo struct {
 	Title       string `json:"title"`
 	Description string `json:"description,omitempty"`
 	Version     string `json:"version"`
-}
-
-type swaggerTag struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
 }
 
 // swaggerPathItem holds HTTP methods plus the custom "ws" key. sticky-bb reads
@@ -125,19 +119,6 @@ func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 	}
 
 	infos := collectActions(actions)
-	actionTags := make([]swaggerTag, 0, len(infos))
-	for _, info := range infos {
-		tagDesc := info.Description
-		if tagDesc == "" {
-			tagDesc = info.Type + " action"
-		}
-		actionTags = append(actionTags, swaggerTag{Name: info.Name, Description: tagDesc})
-	}
-	sort.Slice(actionTags, func(i, j int) bool { return actionTags[i].Name < actionTags[j].Name })
-	spec.Tags = append(
-		[]swaggerTag{{Name: "ws-commands", Description: "Standard WebSocket protocol commands"}},
-		actionTags...,
-	)
 
 	cmds := buildWSProtocolCommands()
 	for _, info := range infos {
