@@ -83,43 +83,56 @@ actions:
 
 ## WebSocket Protocol
 
-Connect at `ws://host:8080/ws`. All messages are JSON. The optional `id` field echoes back in responses for request/response correlation.
+Connect at `ws://host:8080/ws`. All messages are JSON.
+
+> **Correlation ID contract**: every client→server message **must** include a non-empty `id`
+> string. The server echoes `id` back in the corresponding response. Messages without `id`
+> receive an `error` response and the connection stays open.
 
 ### Client → Server
 
-| `type` | Key fields | Description |
-|--------|-----------|-------------|
-| `start` | `action`, `task_id`, `params`, `retry_policy`, `force`, `id` | Start a task |
-| `stop` | `task_id`, `id` | SIGTERM → SIGKILL escalation |
-| `reset` | `task_id`, `id` | Clear errored state and restart |
-| `list` | `since` (RFC3339), `id` | List tasks |
-| `replay` | `task_id`, `since`, `id` | Replay ring-buffer to caller |
-| `subscribe` | `task_id` | Subscribe to a task's output |
-| `unsubscribe` | `task_id` | Unsubscribe |
-| `describe` | `id` | List registered actions and their parameters |
-| `pool_info` | `action`, `id` | Pool state for one or all actions |
-| `set_pool` | `action`, `size`, `id` | Resize a pool at runtime |
-| `purge` | `action`, `id` | Drain the queue for an action |
-| `metrics` | `action`, `task_id`, `id` | In-memory metrics |
+| `type` | Required fields | Optional fields | Description |
+|--------|----------------|-----------------|-------------|
+| `start` | `id`, `action` | `task_id`, `params`, `retry_policy`, `force` | Start a task; `task_id` auto-generated if omitted |
+| `stop` | `id`, `task_id` | | SIGTERM → SIGKILL escalation |
+| `reset` | `id`, `task_id` | | Clear errored state and restart |
+| `list` | `id` | `since` (RFC3339) | List tasks |
+| `replay` | `id`, `task_id` | `since` (RFC3339) | Replay ring-buffer to caller |
+| `subscribe` | `id`, `task_id` | | Subscribe to a task's events |
+| `unsubscribe` | `id`, `task_id` | | Unsubscribe |
+| `describe` | `id` | `action` | List registered actions; filter by `action` if given |
+| `pool_info` | `id` | `action` | Pool state for one or all actions |
+| `set_pool` | `id`, `action`, `size` | | Resize a pool at runtime |
+| `purge` | `id` | `action` | Drain the queue for an action |
+| `metrics` | `id` | `action`, `task_id` | In-memory metrics at global/action/task granularity |
+| `manifest` | `id` | | Retrieve the WS Manifest protocol descriptor |
 
 ### Server → Client
 
-| `type` | Description |
-|--------|-------------|
-| `started` | Worker spawned (`task_id`, `pid`, `ts`) |
-| `output` | Stdout/stderr line (`task_id`, `stream`, `data`, `seq`, `ts`) |
-| `exited` | Worker exited (`task_id`, `exit_code`, `intentional`, `ts`) |
-| `restarting` | Retry scheduled (`task_id`, `attempt`, `restart_delay`, `ts`) |
-| `errored` | Retry threshold exceeded (`task_id`, `exit_count`, `ts`) |
-| `queued` | Task queued in pool (`task_id`, `position`, `ts`) |
-| `dequeued` | Queued task cancelled (`task_id`, `reason`, `ts`) |
-| `tasks` | Response to `list` |
-| `actions` | Response to `describe` |
-| `pool_info` | Response to `pool_info` |
-| `metrics` | Response to `metrics` |
-| `error` | Error response (`message`, `id`) |
+Push events carry no `id` (they are not correlated to a single request).
+Request-response messages echo the `id` from the originating request.
 
-Output events include a monotonically increasing `seq` number per task. Clients can detect
+| `type` | `id` | Key fields | Notes |
+|--------|------|-----------|-------|
+| `started` | echoed | `task_id`, `pid`, `restart_of`, `ts` | Also sent on auto-restart; `restart_of` is previous PID |
+| `tasks` | echoed | `tasks[]` | Response to `list` |
+| `actions` | echoed | `actions[]` | Response to `describe` |
+| `pool_info` | echoed | `action`, `pool` | Response to `pool_info` / `set_pool` |
+| `purged` | echoed | `action`, `count` | Response to `purge` |
+| `subscribed` | echoed | `task_id` | Confirms `subscribe` |
+| `unsubscribed` | echoed | `task_id` | Confirms `unsubscribe` |
+| `metrics` | echoed | `global` / `action` / `task` | Response to `metrics` |
+| `manifest` | echoed | `manifest` | Response to `manifest` |
+| `error` | echoed | `message`, `existing_task_id`? | Error response; connection stays open |
+| `queued` | echoed | `task_id`, `action`, `position`, `ts` | Task accepted into pool queue |
+| `output` | — | `task_id`, `pid`, `stream`, `data`, `seq`, `ts` | Push; subscribers only |
+| `exited` | — | `task_id`, `pid`, `exit_code`, `intentional`, `ts` | Push; subscribers only |
+| `restarting` | — | `task_id`, `pid`, `restart_delay`, `attempt`, `ts` | Push; subscribers only |
+| `errored` | — | `task_id`, `pid`, `exit_count`, `ts` | Push; subscribers only |
+| `dequeued` | — | `task_id`, `reason`, `ts` | Push; broadcast to all clients |
+| `pool_updated` | — | `action`, `pool` | Push; broadcast on `set_pool` |
+
+Output events carry a per-task monotonically increasing `seq` counter. Clients can detect
 ring-buffer gaps after reconnection by comparing `seq` values.
 
 ## Writing a custom driver

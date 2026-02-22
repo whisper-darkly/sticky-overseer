@@ -124,15 +124,19 @@ All messages are JSON. `IncomingMessage` (client→server) dispatches on `type`.
 | `reset` | `task_id`, `id` | clears errored state, restarts |
 | `list` | `since` (RFC3339), `id` | filtered task list |
 | `replay` | `task_id`, `since`, `id` | ring-buffer replay to caller |
-| `subscribe` | `task_id` | subscribe to task events |
-| `unsubscribe` | `task_id` | unsubscribe |
+| `subscribe` | `task_id`, `id` | subscribe to task events |
+| `unsubscribe` | `task_id`, `id` | unsubscribe |
 | `describe` | `id` | list registered actions |
 | `pool_info` | `action`, `id` | pool state |
 | `set_pool` | `action`, `size`, `id` | resize pool |
 | `purge` | `action`, `id` | drain queue |
 | `metrics` | `action`, `task_id`, `id` | in-memory metrics |
+| `manifest` | `id` | full WS Manifest protocol descriptor |
 
 **Server → Client**:
+
+Push events (no `id`): `output`, `exited`, `restarting`, `errored`, `dequeued`, `pool_updated`.
+Request-response messages (echo `id`): everything else.
 
 | type | fields |
 |------|--------|
@@ -145,14 +149,20 @@ All messages are JSON. `IncomingMessage` (client→server) dispatches on `type`.
 | `queued` | `task_id`, `action`, `position`, `ts`, `id` |
 | `dequeued` | `task_id`, `reason`, `ts` |
 | `actions` | `actions[]` (ActionInfo), `id` |
-| `pool_info` | pool state, `id` |
+| `pool_info` | pool state, `action`, `id` |
+| `purged` | `action`, `count`, `id` |
+| `pool_updated` | `action`, `pool` |
+| `subscribed` | `task_id`, `id` |
+| `unsubscribed` | `task_id`, `id` |
 | `metrics` | metrics data, `id` |
+| `manifest` | manifest doc, `id` |
 | `error` | `message`, `id` |
 
 `seq` is a per-task monotonic counter on each output event.
 Reconnecting clients can detect ring-buffer gaps by comparing `seq` values.
 
-The optional `id` field in client messages is echoed back in responses for request/response correlation.
+Every client→server message **must** include a non-empty `id`. Messages missing `id` receive
+an `error` response; the connection remains open. See `docs/PROTOCOL.md` for full contracts.
 
 ### Consumer pattern (how downstream binaries use this library)
 
