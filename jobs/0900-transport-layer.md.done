@@ -1,0 +1,181 @@
+---
+title: Add transport.go with Conn/Transport interfaces and TCP/STDIO/Unix implementations
+created: 2026-02-21
+origin: sticky-overseer architecture refactor - pluggable transport abstraction
+priority: high
+complexity: high
+notes:
+  - This is the foundational network layer for the refactored Hub
+  - Must support TCP, STDIO, and Unix domain sockets
+  - Each transport emits connections to a channel for async handling
+  - Conn interface abstracts WebSocket vs STDIO vs Unix connections
+  - Write locking is now per-connection, not per-Hub
+---
+
+Follow exactly and without stopping:
+
+## Task: Add transport.go with Conn/Transport interfaces and TCP/STDIO/Unix implementations
+
+## Background & Context
+
+The sticky-overseer refactor requires a flexible network transport layer that can support multiple connection types (HTTP/WebSocket, STDIO for testing, Unix sockets for IPC). Currently, the hub.go is tightly coupled to WebSocket connections via gorilla/websocket.
+
+Extracting transport into a separate abstraction layer enables:
+- Multiple simultaneous transport types (e.g., TCP and Unix socket)
+- Easier testing (STDIO transport for unit tests)
+- Cleaner separation of concerns
+- Each connection manages its own write lock instead of Hub managing a per-connection map
+- Consistent JSON message handling across all transport types
+
+## Problem Description
+
+Currently:
+- Hub directly handles WebSocket connections with individual Mutex locks
+- No abstraction for different connection types
+- Adding new transport types requires modifying Hub
+- STDIO connections (useful for testing) are not possible
+- Unix socket support would require extensive refactoring
+
+After refactor:
+- Hub accepts `Conn` interface, agnostic to underlying implementation
+- Multiple transports can run simultaneously, each producing Conn instances
+- Transport layer handles all protocol-specific details (HTTP upgrade, socket creation, etc.)
+- Connection write safety is encapsulated in Conn.WriteLock()
+
+## Implementation Plan
+
+1. Define core interfaces in transport.go:
+
+```go
+// Conn represents a single client connection (any transport type)
+type Conn interface {
+    ReadJSON(v any) error
+    WriteJSON(v any) error
+    Close() error
+    RemoteAddr() string
+    WriteLock() *sync.Mutex
+}
+
+// Transport represents a network transport that produces Conn instances
+type Transport interface {
+    Listen(ctx context.Context) (<-chan Conn, error)
+    String() string
+}
+```
+
+2. Implement `ParseListenAddr(addr string) (Transport, error)`:
+   - Input "STDIO" (case-insensitive) → returns stdioTransport{} 
+   - Input starts with "/" or "./" → returns unixTransport{path: addr}
+   - Input is bare number (e.g. "8080") → returns tcpTransport{addr: ":8080"}
+   - Any other input → returns tcpTransport{addr: addr}
+
+3. Implement TCP transport (`tcpTransport` struct):
+   - HTTP server using gorilla/websocket on `/ws` endpoint
+   - Playground UI served at `/` (use existing embedded UI from main.go or hub.go)
+   - IP trust check applied at WebSocket upgrade time using TrustedNets
+   - Each upgraded WebSocket wrapped in `wsConn` struct implementing Conn interface
+   - wsConn.WriteLock() returns pointer to embedded mutex for serialized writes
+   - Listen method returns channel of Conn, sends one per upgrade, blocks on ctx cancel
+   - String() returns address (e.g. ":8080")
+
+4. Implement STDIO transport (`stdioTransport` struct):
+   - Wraps stdin/stdout with bufio.Scanner (read) and json.Encoder (write)
+   - Emits exactly ONE Conn to the channel
+   - No HTTP, no playground, no IP trust checks
+   - stdioConn reads full JSON lines from stdin via Scanner
+   - stdioConn writes JSON lines to stdout via Encoder
+   - RemoteAddr() returns "stdio"
+   - String() returns "STDIO"
+   - No multiplexing - one connection per transport instance
+   - Channel closes after single connection created
+
+5. Implement Unix socket transport (`unixTransport` struct):
+   - net.Listen("unix", path) on the provided socket path
+   - Gorilla/websocket upgrade on each accepted connection, same as TCP
+   - Socket file cleanup on context cancel or error
+   - Each connection wrapped in wsConn like TCP transport
+   - Can apply same TrustedNets check (or skip for local Unix sockets)
+   - String() returns path
+
+6. Implementation details for wsConn:
+   - Embed `*websocket.Conn`
+   - Embed `sync.Mutex` for write locking
+   - WriteLock() returns pointer to embedded mutex
+   - ReadJSON, WriteJSON delegate to websocket.Conn methods
+   - Close delegates to websocket.Conn.Close()
+   - RemoteAddr() returns websocket.Conn.RemoteAddr().String()
+
+7. Playground UI integration:
+   - Check if playground embed exists in main.go or hub.go
+   - TCP transport should serve existing playground at "/" on HTTP
+   - Keep exact same UI and behavior as current implementation
+
+8. Hub.clients map change:
+   - Will change from `map[*websocket.Conn]*sync.Mutex` 
+   - To `map[Conn]struct{}` (no value needed)
+   - Write lock accessed via `conn.WriteLock()` instead of lookup
+   - This change happens in job 10 (hub refactor)
+
+## Technical Requirements
+
+- File location: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/transport.go` (NEW)
+- Dependencies: gorilla/websocket (already in go.mod), bufio, json, net, context, sync
+- Gorilla websocket import: `github.com/gorilla/websocket`
+- Each transport's Listen() method runs a goroutine to accept connections and emit to channel
+- Channel should be buffered (size 1) to prevent blocking on first emit
+- Context cancellation should clean up resources and close the channel
+
+## Success Criteria
+
+- `go build ./...` succeeds
+- New test `TestParseListenAddr_TCP`: input "8080" → tcpTransport with addr ":8080"
+- New test `TestParseListenAddr_TCP_FullAddr`: input "localhost:9090" → tcpTransport with addr unchanged
+- New test `TestParseListenAddr_BarePort`: input "80" → tcpTransport with addr ":80"
+- New test `TestParseListenAddr_STDIO_Upper`: input "STDIO" → stdioTransport
+- New test `TestParseListenAddr_STDIO_Lower`: input "stdio" → stdioTransport
+- New test `TestParseListenAddr_STDIO_Mixed`: input "StDiO" → stdioTransport
+- New test `TestParseListenAddr_UnixAbsolute`: input "/tmp/foo.sock" → unixTransport{"/tmp/foo.sock"}
+- New test `TestParseListenAddr_UnixRelative`: input "./foo.sock" → unixTransport{"./foo.sock"}
+- New test `TestStdioTransport_Listen`: 
+  - Create stdioTransport
+  - Start Listen with test context
+  - Verify one Conn emitted to channel
+  - Write JSON to Conn, read JSON from Conn
+  - Verify round-trip integrity
+- New test `TestStdioConn_ReadWrite`:
+  - Use io.Pipe to create mock stdin/stdout
+  - Create stdioConn wrapping the pipes
+  - Write JSON message
+  - Read JSON message
+  - Verify equality
+- New test `TestTCPTransport_Listen`:
+  - Create tcpTransport (":0" for dynamic port)
+  - Start Listen
+  - Dial the port, upgrade to WebSocket
+  - Verify Conn emitted to channel
+  - Send/receive JSON
+- New test `TestTCPTransport_TrustedCheck`:
+  - Create tcpTransport with TrustedNets restricted to loopback
+  - Attempt upgrade from non-loopback IP (mock/test only, may use 127.0.0.1 vs ::1)
+  - Verify upgrade rejected with 403 or connection refused
+
+## Expected Outcome
+
+A flexible transport abstraction layer that decouples Hub from specific network protocols. Multiple transport types (TCP, STDIO, Unix) can be used independently or simultaneously. Each connection type presents a consistent Conn interface to the Hub.
+
+## Reference Information
+
+- Gorilla WebSocket docs: https://github.com/gorilla/websocket
+- Current WebSocket handler: check existing `/ws` handler in hub.go or main.go for playground serving
+- Related job 10: Hub refactor that uses this transport layer
+- Related job 11: main.go updates to wire transport with configuration
+- Commands to test: `go test -race ./... -run TestTransport`, `go test -race ./... -run TestParseListenAddr`
+
+## Notes & Warnings
+
+- Playground UI must continue working for TCP transport (most important use case)
+- STDIO transport is single-connection only - each invocation creates a new transport instance
+- Unix socket cleanup is critical - use defer to ensure socket file removal
+- WebSocket upgrade must check IP trust before accepting connection
+- Each Conn's WriteLock must be used by Hub to prevent concurrent writes on same connection
+- Context cancellation should gracefully close all resources

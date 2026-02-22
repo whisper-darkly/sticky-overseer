@@ -1,0 +1,241 @@
+---
+title: Update main.go with new flags, ENV pins, and updated startup sequence
+created: 2026-02-21
+origin: sticky-overseer architecture refactor - configuration system integration
+priority: high
+complexity: medium
+notes:
+  - Removes old -command and -port flags
+  - Adds new -config flag for YAML configuration
+  - ENV overrides applied after config load, fixed for process lifetime
+  - Startup sequence now includes pool, actions, and transport initialization
+  - Graceful shutdown includes pool drain before worker termination
+---
+
+Follow exactly and without stopping:
+
+## Task: Update main.go with new flags, ENV pins, and updated startup sequence
+
+## Background & Context
+
+The refactored sticky-overseer uses a YAML configuration system for actions, pool policies, and trusted networks. The main.go must be updated to load and wire this configuration, build action handlers, initialize the pool manager, and select the appropriate transport based on the listen address.
+
+The startup sequence is now significantly more complex, involving:
+1. Config loading
+2. Database initialization with v2→v3 migration
+3. Building action handlers from config
+4. Pool manager initialization per-action configuration
+5. Transport selection and startup
+6. Graceful shutdown with pool drain
+
+## Problem Description
+
+Current main.go:
+- Uses `-command` flag (removed in refactor)
+- Uses `-port` flag (superseded by config Listen)
+- No YAML configuration support
+- No action builder
+- No pool manager initialization
+- No transport abstraction
+
+After refactor:
+- `-config` flag specifies YAML file path
+- `-version` and `-help` flags for information
+- `--list-handlers` to show registered action types
+- Environment variable overrides for listen and DB paths
+- Comprehensive startup integrating all components
+
+## Implementation Plan
+
+1. Update command-line flags:
+   - Remove: `-command <cmd>` flag
+   - Remove: `-port <num>` flag
+   - Add: `-config <path>` (required, defaults to "./config.yaml")
+   - Add: `-version` (print version and exit 0)
+   - Add: `-help` (print usage and exit 0)
+   - Add: `--list-handlers` (print registered handlers and exit 0)
+
+2. Environment variable handling:
+   - `OVERSEER_CONFIG` → overrides `-config` flag value
+   - `OVERSEER_LISTEN` → overrides `config.Listen` (applied AFTER config load)
+   - `OVERSEER_DB` → overrides `config.DB` (applied AFTER config load)
+   - Applied as fixed overrides immediately after config load, before any other initialization
+
+3. Version management:
+   - Define `const version = "v1.1.0"` (or appropriate version)
+   - Use in `-version` output
+   - Can be overridden at build time with `-ldflags`
+
+4. Startup sequence (in order):
+   ```
+   1. flag.Parse() → extract all command-line arguments
+   
+   2. Handle -help (or default to usage if no config)
+      flag.Usage() shows all flags and defaults
+   
+   3. Handle -version
+      Print "sticky-overseer <version>" and exit 0
+   
+   4. Handle --list-handlers
+      Call actionHandlers.ListHandlers() (function in actions.go)
+      Print registered handler types (exec, etc.) and exit 0
+   
+   5. Load configuration
+      cfg, err := loadConfig(configPath)
+      If error: print "failed to load config: <err>" and exit 1
+   
+   6. Apply ENV overrides (if set, override config values)
+      if listenEnv := os.Getenv("OVERSEER_LISTEN"); listenEnv != "" {
+          cfg.Listen = listenEnv
+      }
+      if dbEnv := os.Getenv("OVERSEER_DB"); dbEnv != "" {
+          cfg.DB = dbEnv
+      }
+   
+   7. Open database
+      db, err := openDB(cfg.DB)
+      If error: print error and exit 1
+      This includes v2→v3 migration automatically
+   
+   8. Build action handlers
+      actions, err := buildActionHandlers(cfg)
+      If error: print error and exit 1
+   
+   9. Initialize pool manager
+      poolCfgs := extractPoolConfigs(cfg)  // map[string]PoolConfig from cfg.Actions
+      pool := NewPoolManager(cfg.TaskPool, poolCfgs)
+   
+   10. Parse listen address and select transport
+       transport, err := ParseListenAddr(cfg.Listen)
+       If error: print error and exit 1
+   
+   11. Open event log if configured
+       var eventLog io.Writer
+       if cfg.LogFile != "" {
+           f, err := os.OpenFile(cfg.LogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+           If error: print error and exit 1
+           eventLog = f
+           defer f.Close()
+       }
+   
+   12. Create Hub
+       h := newHub(hubConfig{
+           DB:          db,
+           EventLog:    eventLog,
+           Actions:     actions,
+           Pool:        pool,
+           TrustedNets: trustedNetworks,  // from cfg or defaults
+       })
+   
+   13. Setup graceful shutdown
+       ctx, cancel := context.WithCancel(context.Background())
+       sigChan := make(chan os.Signal, 1)
+       signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+       
+       go func() {
+           <-sigChan
+           cancel()
+       }()
+   
+   14. Start transport listening
+       connChan, err := transport.Listen(ctx)
+       If error: print error and exit 1
+       
+       for conn := range connChan {
+           go h.HandleClient(conn)
+       }
+   
+   15. Shutdown handling (triggered by context cancel)
+       // Pool drain (cancel all queued items)
+       h.pool.DrainAll()
+       
+       // Stop all running workers
+       // (existing graceful shutdown logic from worker)
+       
+       // Wait 15 seconds or until all workers exit
+       // Then close DB
+       db.Close()
+   ```
+
+5. Configuration loading (`loadConfig(path string) (*Config, error)`):
+   - If path is empty: use "./config.yaml"
+   - If file doesn't exist: return zero config with defaults
+   - Parse YAML file (use existing config.go from job 03)
+   - Return populated Config struct
+
+6. Extract pool configs helper:
+   ```go
+   func extractPoolConfigs(cfg *Config) map[string]PoolConfig {
+       pcs := make(map[string]PoolConfig)
+       for name, ac := range cfg.Actions {
+           pcs[name] = ac.TaskPool
+       }
+       return pcs
+   }
+   ```
+
+7. Trusted networks setup:
+   - If `cfg.TrustedCIDRs` is non-empty: use those
+   - Else: use existing logic (loopback + local interface subnets)
+   - Parse CIDR strings to []*net.IPNet
+   - Pass to hubConfig
+
+8. Signal handling:
+   - Catch SIGINT and SIGTERM
+   - Trigger graceful shutdown via context cancel
+   - 15-second timeout for complete shutdown
+   - Exit code 0 for graceful, 1 for timeout/error
+
+9. Output and logging:
+   - Print to stderr for errors/info
+   - No TLS/HTTPS setup (out of scope)
+   - Playground UI available via transport (TCP only)
+
+## Technical Requirements
+
+- File location: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/main.go`
+- Imports needed: flag, log, os, syscall, signal, context, net, sql, io
+- Version constant should be visible/overridable by build flags
+- Config loading from job 03 (config.go)
+- Actions building from job 04 (actions.go)
+- Pool manager from job 06 (pool.go)
+- Transport from job 09 (transport.go)
+- Hub from job 10 (hub.go)
+- Existing helpers: openDB (store.go), newHub (hub.go)
+
+## Success Criteria
+
+- `go build ./...` succeeds
+- `./dist/sticky-overseer -help` prints usage with new flags, exits 0
+- `./dist/sticky-overseer -version` prints version string, exits 0
+- `./dist/sticky-overseer --list-handlers` prints handler types (exec, etc.), exits 0
+- `./dist/sticky-overseer -config /nonexistent.yaml` exits 1 with error message
+- With valid config file: server starts, prints listen address, ready for connections
+- SIGTERM during startup: graceful shutdown, waits for workers, closes DB
+- ENV overrides work: `OVERSEER_LISTEN=":9090" ./dist/sticky-overseer` uses port 9090
+- No port conflicts: can start multiple instances on different OVERSEER_LISTEN values
+
+## Expected Outcome
+
+main.go fully refactored to wire all new components. Configuration-driven startup with YAML config file. Graceful shutdown includes pool drain. Action discovery via --list-handlers. Environment variable overrides for deployment flexibility.
+
+## Reference Information
+
+- Job 03: Config.go with loadConfig, Config struct
+- Job 04: Actions system with buildActionHandlers
+- Job 06: PoolManager with NewPoolManager, SetLimits
+- Job 09: Transport with ParseListenAddr
+- Job 10: Hub with HandleClient
+- Job 08: Store with openDB (includes v2→v3 migration)
+- Build command: `make build` compiles to dist/sticky-overseer
+- Test command: `./dist/sticky-overseer -help`
+
+## Notes & Warnings
+
+- ENV overrides take precedence over config file values
+- Pool drain should happen BEFORE stopping workers
+- 15-second shutdown timeout should be hardcoded (not configurable)
+- No SIGHUP handling (config is loaded once)
+- No fsnotify for config changes
+- Error messages should be clear and printed to stderr
+- Graceful shutdown must close DB before exit to flush WAL

@@ -1,0 +1,189 @@
+---
+title: Add Dynamic OpenAPI Schema Generation for Registered Actions
+created: 2026-02-21
+origin: OpenAPI spec at /openapi.json only shows empty paths; sticky-bb needs action discovery via OpenAPI spec
+priority: medium
+complexity: medium
+notes:
+  - Current OpenAPI spec is static embedded file with empty paths
+  - Actions are already exposed dynamically via the describe WS command
+  - Need to mirror actions structure in OpenAPI spec so REST/Swagger clients can discover them
+  - /openapi.json should become the canonical source of action metadata for REST clients
+  - spec should regenerate at startup based on registered handlers
+---
+
+Follow exactly and without stopping:
+
+## Task: Implement Dynamic OpenAPI Schema Generation for Registered Actions
+
+## Background & Context
+
+The sticky-overseer exposes registered actions (e.g., chaturbate, stripchat with their params schemas) via the `describe` WS command, which returns a `WSManifest` that includes the complete Actions array with ActionInfo objects (name, type, description, params with ParamSpec, task_pool, retry, dedupe_key).
+
+The REST/OpenAPI side is currently broken — `/openapi.json` serves a static embedded swagger.json with `"paths": {}` (completely empty).
+
+sticky-bb reads the OpenAPI spec to populate Swagger UI and discover available actions. The goal is to dynamically generate OpenAPI paths from the registered action handlers at startup, making `/openapi.json` the canonical REST discovery endpoint for actions.
+
+This work was revealed when integrating sticky-bb with sticky-overseer and realizing that the OpenAPI spec wasn't being used for action discovery because it had no paths defined.
+
+## Problem Description
+
+**Specific Symptom**: `/openapi.json` returns a valid Swagger 2.0 spec but with empty `paths: {}`, so Swagger UI shows no operations.
+
+**Why It Matters**:
+- sticky-bb (and other REST clients) rely on OpenAPI specs for runtime service discovery
+- Without action metadata in OpenAPI, tools cannot introspect available actions or their parameter requirements
+- The action registry already contains all this information; it just isn't being serialized into the spec
+
+**Current Workaround**: Clients must connect via WebSocket and use the `describe` command instead.
+
+**Discovery Context**: The problem was identified during sticky-bb integration testing when verifying that the Swagger UI could display available actions.
+
+## Implementation Plan
+
+1. **Analyze Current OpenAPI Generation**
+   - Examine how the static swagger.json is currently embedded (transport.go, line 26: `//go:embed docs/swagger.json`)
+   - Understand the Swagger 2.0 specification structure (what needs to be in `paths` for action operations)
+   - Identify where/how the endpoint handler serves the spec (transport.go, lines 156-159)
+
+2. **Study Action Structure**
+   - Review ActionInfo struct in actions.go (lines 68-94) to understand metadata available: name, type, description, params (map[string]*ParamSpec), task_pool, retry, dedupe_key
+   - Review ParamSpec structure (likely defined in actions.go or config.go) to see what parameter validation/documentation is available
+   - Verify how collectActions() in manifest.go (lines 779-791) gathers action info at runtime
+   - Understand how the hub (hub.go) maintains the actions map and makes it available to the transport
+
+3. **Design OpenAPI Schema Mapping**
+   - Map ActionInfo fields to OpenAPI components:
+     * action.name → x-action-name or operationId
+     * action.description → summary/description
+     * action.type → x-action-type tag
+     * action.params → requestBody/parameters with schema generation from ParamSpec
+     * action.task_pool → x-task-pool custom extension
+     * action.retry → x-retry custom extension
+     * action.dedupe_key → x-dedupe-key custom extension
+   - Decide whether to create paths like `/actions/{actionName}/start` or use custom OpenAPI extensions in components/schemas section
+   - Consider whether actions should be represented as:
+     * Separate POST paths (e.g., `/actions/chaturbate/start`)
+     * Schema definitions in components/schemas with a unified actions endpoint
+     * Custom x-actions extension at root level (simplest, mirrors manifest structure)
+
+4. **Implement Dynamic Spec Generation**
+   - Create a new function (suggest name: BuildOpenAPISpec or GenerateOpenAPISpec) that:
+     * Takes the actions map[string]ActionHandler as input
+     * Returns a Swagger 2.0 spec structure (or raw JSON) with populated paths/definitions
+     * Should live in a new file (suggest: openapi.go) alongside manifest.go
+   - Function should:
+     * Build Swagger 2.0 info object with title, version, description from overseer metadata
+     * Iterate over actions map
+     * For each action, create path entry with POST operation
+     * Generate schema for action params from ParamSpec
+     * Include action metadata as extension fields or description text
+   - Ensure function signature allows passing version string and action handlers
+
+5. **Integrate into Transport**
+   - Modify transport.go `/openapi.json` handler (lines 156-159) to:
+     * Call BuildOpenAPISpec with hub.actions and version (similar to how manifest building works)
+     * Lock hub.mu for safe read access to actions map
+     * JSON-encode the result and write to response
+     * Handle errors gracefully (log, but don't crash)
+   - Remove the static `//go:embed docs/swagger.json` reference if no longer needed, or keep it as fallback
+
+6. **Update Swagger Docs**
+   - Once dynamic generation is implemented, determine if docs/swagger.json should still be manually maintained
+   - Options:
+     * Delete docs/swagger.json and rely entirely on dynamic generation
+     * Keep it as an example/documentation-only file
+     * Generate it at build time if tooling supports it
+   - Update docs/swagger.yaml (the YAML version) to match, if it's still used
+
+7. **Testing**
+   - Verify `/openapi.json` returns valid Swagger 2.0 spec with proper structure
+   - Confirm that registered actions appear in the paths with correct metadata
+   - Test that param schemas are generated correctly for ParamSpec with validation rules
+   - Verify spec regenerates correctly if actions change (manual verification during startup)
+   - Ensure no errors occur when spec is fetched via HTTP
+   - Test with actual sticky-bb integration to confirm Swagger UI can consume the spec
+
+## Technical Requirements
+
+**File Paths**:
+- Main implementation: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/openapi.go` (new file)
+- Modify: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/transport.go` (lines 156-159)
+- Reference: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/manifest.go` (BuildManifest function pattern)
+- Reference: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/actions.go` (ActionInfo, ParamSpec structures)
+- Reference: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go` (Config, PoolConfig structures)
+- Docs: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/docs/swagger.json` (may need update or removal)
+- Docs: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/docs/swagger.yaml` (may need update)
+
+**Dependencies**:
+- No new external packages needed (use stdlib encoding/json)
+- Reference Swagger 2.0 spec format: https://swagger.io/specification/v2/
+- Can study existing manifest.go pattern for struct-to-JSON mapping
+
+**Commands**:
+- `go build` to test compilation after changes
+- `curl http://localhost:8080/openapi.json | jq .` to inspect output
+- Swagger Editor at https://editor.swagger.io/ for validating generated specs
+- Tests should verify spec structure and action presence
+
+**Reference Implementations**:
+- BuildManifest() in manifest.go shows how to dynamically build JSON-serializable structs from handler metadata
+- collectActions() in manifest.go shows how to safely read actions map and gather ActionInfo
+- tcpTransport.Listen() in transport.go shows how to register HTTP handlers and access hub.actions safely with read locks
+
+## Success Criteria
+
+- `/openapi.json` endpoint returns valid Swagger 2.0 specification (no parsing errors)
+- Spec includes all registered actions from the config as path entries or schema definitions
+- Each action includes: name, type, description, param schemas (with validation rules), task_pool, retry policy, dedupe_key
+- Parameter schemas accurately reflect ParamSpec validation rules (CEL expressions should be described, defaults documented)
+- Spec regenerates correctly at each server startup with current action registry
+- No errors logged during spec generation or serving
+- sticky-bb can load and display actions from the spec in Swagger UI
+- Tests verify spec structure and completeness for representative action configurations
+
+## Expected Outcome
+
+When sticky-overseer starts, the `/openapi.json` endpoint will serve a dynamically generated Swagger 2.0 spec that:
+1. Lists all registered actions (e.g., chaturbate, stripchat, etc.)
+2. Includes action metadata: type, description, parameter definitions
+3. Allows sticky-bb and other REST clients to discover and introspect available actions without WebSocket
+
+This makes `/openapi.json` the canonical REST discovery endpoint, replacing the need for any separate manifest-over-HTTP mechanism.
+
+## Reference Information
+
+**Key Code Locations**:
+- Action registration: `BuildActionHandlers()` in actions.go (lines 110-138)
+- Action metadata: `ActionInfo` struct in actions.go (lines 68-94)
+- Parameter spec: `ParamSpec` struct (find in actions.go or config.go)
+- Manifest generation: `BuildManifest()` in manifest.go (lines 86-103), `collectActions()` (lines 779-791)
+- HTTP handler setup: tcpTransport.Listen() in transport.go (lines 140-228)
+- OpenAPI endpoint: lines 156-159 in transport.go
+- Static spec location: `docs/swagger.json` and `docs/swagger.yaml`
+
+**Swagger 2.0 Specification Reference**: https://swagger.io/specification/v2/
+- Paths object: https://swagger.io/specification/v2/#paths-object
+- Path Item object: https://swagger.io/specification/v2/#path-item-object
+- Operation object: https://swagger.io/specification/v2/#operation-object
+- Parameter object: https://swagger.io/specification/v2/#parameter-object
+- Schema object: https://swagger.io/specification/v2/#schema-object
+- Custom extensions: https://swagger.io/specification/v2/#specification-extensions (x-* fields)
+
+**Related Endpoints**:
+- `/openapi.json` — OpenAPI/Swagger endpoint (currently serves static spec, should be dynamic)
+- `/ws` — WebSocket upgrade endpoint and `describe` command
+
+**Existing Work**:
+- sticky-bb integration: handles OpenAPI spec consumption and proxies it to the browser
+- manifest.go pattern: demonstrates dynamic data generation from handler registry
+- transport.go handler pattern: shows HTTP endpoint registration
+
+## Notes & Warnings
+
+- Take care to use proper read locks (hub.mu.RLock()) when accessing hub.actions, following the pattern in transport.go lines 164-167
+- Swagger 2.0 vs OpenAPI 3.0: This codebase uses Swagger 2.0 (check existing docs/swagger.json). Stick with Swagger 2.0 for consistency, though migrating to OpenAPI 3.0 could be a future enhancement
+- ParamSpec likely uses CEL validation expressions; these should be documented in the schema, either in description or as custom x-validate field
+- Remove the embed directive and static fallback once dynamic generation is working — there is no need to maintain both
+- Test thoroughly with sticky-bb to confirm Swagger UI properly loads and displays the generated spec
+- Consider error handling: what happens if action handlers have invalid schemas? Log warnings but don't crash the endpoint

@@ -1,0 +1,195 @@
+---
+title: "Update all tests for post-audit architecture"
+created: 2026-02-21
+origin: Post-audit improvement plan (final job, after all 1300-1400 changes land)
+priority: high
+complexity: high
+notes:
+  - This job runs LAST — after all jobs 1300-1400 are complete
+  - Must fix any compile errors from architecture changes before adding new tests
+  - Target: go test -race ./... all green, go vet ./... clean
+  - Key changes to accommodate: DB removal, subscriptions, dedup, seq numbers, template delimiters,
+    process group kill, metrics, output filtering, pool lock restructure
+---
+
+## Goal
+
+Update every `*_test.go` file so that `go test -race ./...` passes after all jobs 1300-1400
+have been applied.  This is the final integration job — treat compile errors as the first
+priority before writing new test cases.
+
+---
+
+## Step 1 — Fix compile errors first
+
+Run:
+```bash
+cd /home/mmulligan/Development/whisper-darkly-github/sticky-overseer
+go build ./...
+go test -race ./... 2>&1 | head -100
+```
+
+Fix every compile error before proceeding.  Common expected breakages:
+
+| File | Expected issue | Fix |
+|------|---------------|-----|
+| hub_test.go | hubConfig no longer has DB field (job 1350) | Remove DB from test hubConfig |
+| hub_test.go | handleStartLegacy removed (job 1350) | Remove any calls |
+| hub_test.go | Broadcast signature changed to BroadcastToSubscribers (job 1380) | Update calls |
+| hub_test.go | OutputMessage now has Seq field (job 1330) | Update struct literals |
+| handler_exec_test.go | Template delimiters changed from `{param}` to `[[param]]` (job 1320) | Update all test commands |
+| store_test.go | Task CRUD functions removed (job 1350) | Remove task CRUD tests |
+| pool_test.go | QueuedItem / pool API changes (job 1360) | Update construction |
+| messages_test.go | StateQueued moved, new message types | Update if needed |
+
+---
+
+## Step 2 — hub_test.go updates
+
+### Remove / update broken helpers
+
+- `newHubEnv` or equivalent: ensure `hubConfig` no longer passes `DB *sql.DB` (optional field
+  removed in job 1350).  If DB field is now optional/nil-safe, pass nil.
+- Remove any `handleStartLegacy` test helpers or test cases.
+- If `wsConn` test wrapping changed, update accordingly.
+
+### Subscription tests (new — from job 1380)
+
+```go
+// TestAutoSubscribeOnStart: start a task from connA; verify connA receives output/exited
+// events; verify connB (never subscribed) does NOT receive those events.
+
+// TestManualSubscribe: connB sends {"type":"subscribe","task_id":"<id>"}; verify connB
+// then receives output events.
+
+// TestUnsubscribe: connA subscribes, receives events, then sends
+// {"type":"unsubscribe","task_id":"<id>"}; verify connA stops receiving events.
+
+// TestSubscribeUnknownTask: subscribe to nonexistent task_id should return error message
+// not crash.
+```
+
+### Deduplication tests (new — from job 1390)
+
+```go
+// TestDedup_RejectDuplicate: two start messages with same dedupe_key params for same
+// action; second should receive {"type":"error","message":"...already running..."}.
+
+// TestDedup_DifferentParams_BothStart: two start messages with different dedupe_key
+// param values; both should succeed.
+
+// TestDedup_AfterExited_AllowsRestart: task with dedupe_key exits; new start with same
+// params succeeds (no longer "running").
+```
+
+### Sequence number tests (new — from job 1330)
+
+```go
+// TestOutputSeqNumbers: start a task that emits N lines; collect all output messages;
+// verify Seq field is 1, 2, 3, ... N (monotonically increasing per task).
+
+// TestSeqNumbersResetPerTask: two tasks running concurrently; each has independent
+// sequence counter starting at 1.
+```
+
+### Metrics handler tests (new — from job 1400)
+
+```go
+// TestMetricsGlobal: start + finish a task; send {"type":"metrics"}; verify response
+// has global tasks_started >= 1.
+
+// TestMetricsAction: send {"type":"metrics","action":"echo"}; verify action-level counts.
+
+// TestMetricsTask: send {"type":"metrics","task_id":"<id>"}; verify task-level counts.
+```
+
+### Process group kill test (new — from job 1300)
+
+```go
+// TestProcessGroupKill: start a shell command that spawns a child process
+// (e.g., /bin/sh -c "sleep 60 & sleep 60"); send stop; verify both parent and
+// children are gone after stop (use kill -0 to check PIDs).
+```
+
+---
+
+## Step 3 — worker_test.go updates
+
+```go
+// TestLargeOutputLine: write a 2MB line to worker stdin/stdout; verify it is received
+// complete without truncation (scanner buffer set to 10MB max in job 1300).
+
+// TestScannerErr: simulate a pipe error mid-scan; verify worker transitions to errored
+// state and onExit callback is called (not silently dropped).
+```
+
+---
+
+## Step 4 — store_test.go updates
+
+- Remove ALL task CRUD tests (createTask, getTask, listTasks, updateTaskState, etc.)
+  — these functions no longer exist after job 1350.
+- Keep / update `TestOpenDB` to verify minimal schema: only `exit_history` table exists
+  with correct columns.
+- Add exit history tests (from job 1370):
+
+```go
+// TestRecordExit: call RecordExit; query DB; verify row present with correct values.
+
+// TestLoadExitHistory: insert records with varying timestamps; call LoadExitHistory with
+// a time window; verify only records within the window are returned.
+```
+
+---
+
+## Step 5 — handler_exec_test.go updates
+
+- Replace ALL occurrences of `{param_name}` in test command strings with `[[param_name]]`.
+- Add output filter tests:
+
+```go
+// TestOutputFilter_CEL: create handler with stdout CEL filter `size(data) > 5`; start
+// task; verify short lines are filtered and long lines pass through.
+
+// TestOutputFilter_Empty: no filter → all lines pass.
+
+// TestOutputFilter_InvalidCEL: malformed CEL expression → Create() or Validate() returns
+// non-nil error.
+```
+
+---
+
+## Step 6 — pool_test.go updates
+
+- Update any test construction that broke due to job 1360 API changes.
+- Add lock-safety tests:
+
+```go
+// TestPool_CancelFnOutsideLock: use a channel-based cancelFn that would deadlock if
+// called under pm.mu (it tries to call pool.Info() or similar inside the fn).
+// Verify the function completes without deadlock.
+
+// TestPool_ReleaseNoOverrun: concurrent goroutines that Acquire + Release; use atomic
+// counter to verify running count never exceeds limit.
+```
+
+---
+
+## Step 7 — Final verification
+
+```bash
+cd /home/mmulligan/Development/whisper-darkly-github/sticky-overseer
+go vet ./...
+go test -race ./...
+make build
+```
+
+All must pass with zero failures and zero race conditions.
+
+## Success criteria
+
+- `go test -race ./...` → all green, 0 failures
+- `go vet ./...` → no issues
+- `make build` → binary compiles
+- All new features from jobs 1300-1400 have at least one integration test
+- No test file contains empty function bodies or `t.Skip("TODO")`

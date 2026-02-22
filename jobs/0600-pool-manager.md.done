@@ -1,0 +1,254 @@
+---
+title: Add pool.go with PoolManager, TaskQueue, and all pool/queue/displace logic
+created: 2026-02-21
+origin: sticky-overseer major architecture refactor — implementing multi-layer task pool system with queue and displacement
+priority: critical
+complexity: high
+notes:
+  - PoolManager is critical for concurrency control and task queuing; heavily tested required
+  - Global queue ordering uses actionOrder slice tracking action names by recency
+  - Displacement logic is complex: per-action displace vs global displace vs prohibit
+  - Forced tasks have preferential treatment: preferred for admission, preferred to displace non-forced
+  - Age-based expiry background goroutine needed; lazily checked on dequeue too
+  - All timings in tests should use short durations (ms) for speed; configure max_age/grace in test
+---
+
+Follow exactly and without stopping:
+
+## Task: Add pool.go with PoolManager, TaskQueue, and all pool/queue/displace logic
+
+## Background & Context
+The refactor introduces a multi-layer task pool system to manage concurrency:
+- Global pool limit (max concurrent tasks across all actions)
+- Per-action pool limits (max concurrent tasks per action)
+- Optional queuing when limits reached (FIFO/LIFO orderings)
+- Task displacement when queue is full (smart eviction preserving forced tasks)
+- Age-based expiry (tasks waiting too long are cancelled)
+- Graceful drain on shutdown (all queued tasks notified of shutdown)
+
+PoolManager orchestrates these layers. It tracks running tasks, queues waiting tasks, handles displacement logic, and manages age-based expiry. Hub calls PoolManager methods when starting/stopping tasks. Web clients get pool state via info() calls.
+
+## Problem Description
+Current architecture has no concurrency limits. Multiple tasks can consume unbounded system resources. New architecture requires:
+- Limit concurrent task count (global + per-action)
+- Queue excess tasks with configurable order (FIFO/LIFO)
+- Displace queued tasks when queue full and forced task arrives
+- Expire old queued tasks after max_age seconds
+- Support per-action pool configuration (limits, queue size, displacement policy)
+- Graceful shutdown that notifies all queued tasks
+
+## Implementation Plan
+1. Create /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/pool.go
+2. Define QueueOrder and ExcessAction enums:
+   ```go
+   type QueueOrder string
+   const (
+       OrderFirst QueueOrder = "first"  // FIFO
+       OrderLast  QueueOrder = "last"   // LIFO
+   )
+   
+   type ExcessAction string
+   const (
+       ExcessStop    ExcessAction = "stop"
+       ExcessRequeue ExcessAction = "requeue"
+   )
+   
+   type KillOrder string
+   const (
+       KillFirst KillOrder = "first"  // longest running
+       KillLast  KillOrder = "last"   // shortest running
+   )
+   ```
+3. Define PoolConfig (with YAML tags for config.go to parse):
+   ```go
+   type PoolConfig struct {
+       Limit  int          `yaml:"limit" json:"limit"`
+       Queue  *QueueConfig `yaml:"queue" json:"queue,omitempty"`
+       Excess ExcessConfig `yaml:"excess" json:"excess,omitempty"`
+   }
+   
+   type QueueConfig struct {
+       Enabled  bool           `yaml:"enabled" json:"enabled"`
+       Size     int            `yaml:"size" json:"size"`
+       Order    QueueOrder     `yaml:"order" json:"order"`
+       MaxAge   int            `yaml:"max_age" json:"max_age"`
+       Displace DisplacePolicy `yaml:"displace" json:"displace"`
+   }
+   
+   type ExcessConfig struct {
+       Action ExcessAction `yaml:"action" json:"action"`
+       Order  KillOrder    `yaml:"order" json:"order"`
+       Grace  int          `yaml:"grace" json:"grace"`
+   }
+   ```
+4. Define RunningEntry and QueuedItem:
+   ```go
+   type RunningEntry struct {
+       taskID    string
+       action    string
+       startedAt time.Time
+       forced    bool
+       stop      func()  // context cancel or signal handler
+   }
+   
+   type QueuedItem struct {
+       taskID     string
+       action     string
+       enqueuedAt time.Time
+       forced     bool
+       startFn    func() error  // called when item is dequeued
+   }
+   
+   type QueuedItemInfo struct {
+       TaskID     string    `json:"task_id"`
+       Action     string    `json:"action"`
+       QueuedAt   time.Time `json:"queued_at"`
+       Position   int       `json:"position"`
+       Forced     bool      `json:"forced"`
+   }
+   ```
+5. Define TaskQueue (per-action queue):
+   ```go
+   type TaskQueue struct {
+       cfg     *QueueConfig
+       items   []QueuedItem
+       mu      sync.Mutex
+   }
+   
+   // Methods:
+   func (q *TaskQueue) Enqueue(item QueuedItem) bool  // returns true if enqueued, false if queue full
+   func (q *TaskQueue) Dequeue() *QueuedItem           // FIFO/LIFO based on order
+   func (q *TaskQueue) Remove(taskID string) bool      // returns true if found and removed
+   func (q *TaskQueue) Info() []QueuedItemInfo
+   ```
+6. Define PoolInfo and PoolManager:
+   ```go
+   type PoolInfo struct {
+       Limit      int              `json:"limit"`
+       Running    int              `json:"running"`
+       QueueDepth int              `json:"queue_depth"`
+       QueueItems []QueuedItemInfo `json:"queue_items,omitempty"`
+   }
+   
+   type PoolManager struct {
+       mu          sync.Mutex
+       globalCfg   PoolConfig
+       actionCfgs  map[string]PoolConfig
+       running     []RunningEntry
+       queues      map[string]*TaskQueue
+       actionOrder []string  // action names by last-enqueued
+   }
+   ```
+7. Implement PoolManager.NewPoolManager():
+   ```go
+   func NewPoolManager(globalCfg PoolConfig, actionCfgs map[string]PoolConfig) *PoolManager
+   ```
+8. Implement PoolManager.Acquire():
+   - Check if running count < global limit: if yes, start immediately (call startFn, return nil)
+   - If not, check if queuing enabled and queue not full: enqueue and return nil
+   - If queue full:
+     - If forced: try displacement (see displacement logic below)
+     - If not forced: check if action queue has displace=true, if yes try displacement
+     - If displacement succeeds: enqueue
+     - Else: return error (rejected)
+   - Update actionOrder if action enqueued
+9. Implement PoolManager.Release():
+   - Remove from running
+   - Get next queued item (FIFO/LIFO from action queues using global order)
+   - If found: call startFn (synchronously or async — spec TBD, likely async)
+   - Else: do nothing
+10. Implement displacement logic (complex):
+    - Identify displaceable queue: prioritize action-level displace=true, then global displace=true
+    - Check prohibit: skip queues with displace=prohibit
+    - Select item to displace:
+      - Prefer non-forced items (forced items protected)
+      - Within forced/non-forced group: use KillOrder (first=longest running, last=shortest)
+    - Remove item, call startFn with error, increment count
+    - Return count displaced
+11. Implement PoolManager.SetLimits():
+    - Update globalCfg or actionCfgs[action]
+    - If limit decreased and running > new limit:
+      - If excess.action=stop: SIGTERM oldest running (KillOrder logic)
+      - If excess.action=requeue: move newest running to queue
+    - Wait for grace period before SIGKILL
+12. Implement PoolManager.Dequeue():
+    - Find and remove taskID from any queue
+    - Return true if found, false otherwise
+13. Implement PoolManager.PurgeQueue():
+    - If action="": purge all queues, call startFn(error) for each
+    - Else: purge only action queue
+    - Return count purged
+14. Implement PoolManager.Info():
+    - If action="": return global pool info + all action pool infos (map)
+    - Else: return specific action pool info
+15. Implement PoolManager.DrainAll():
+    - On shutdown: call startFn(error) for all queued items
+    - Clear running, queues
+16. Implement age-based expiry:
+    - Background goroutine (started in NewPoolManager):
+      - Calculate tick interval: min(non-zero max_age) / 2
+      - Periodically sweep all queues:
+        - Remove items older than max_age
+        - Call startFn(error) for each expired item
+        - Broadcast dequeued event (to be implemented in hub.go)
+    - Also check lazily in Dequeue() before returning
+17. Write comprehensive unit tests:
+    - TestPool_Unlimited: no limit, tasks start immediately
+    - TestPool_Reject_Overflow: limit=1, no queue, second task rejected
+    - TestPool_Queue_FIFO: order=first, verify FIFO execution order
+    - TestPool_Queue_LIFO: order=last, verify LIFO execution order
+    - TestPool_MaxAge_Expiry: items expire, startFn called with error
+    - TestPool_Displace_True: displace=true removes item on overflow
+    - TestPool_Displace_Prohibit: prohibit blocks displacement
+    - TestPool_Forced_Preferential: forced task can displace non-forced
+    - TestPool_NonForced_CannotDisplaceForced: non-forced cannot displace forced
+    - TestPool_Release_Triggers_Queue: Release() dequeues next item
+    - TestPool_SetLimits_Excess_Stop: excess.action=stop kills excess
+    - TestPool_SetLimits_Excess_Requeue: excess.action=requeue requeues excess
+    - TestPool_Dequeue_ByTaskID: Dequeue(taskID) removes specific task
+    - TestPool_PurgeQueue_ByAction: purge single action
+    - TestPool_PurgeQueue_All: action="" purges all
+    - TestPool_DrainAll: all items notified on shutdown
+    - TestPool_GlobalOrder_FIFO: cross-action FIFO respects global order
+    - TestPool_GlobalOrder_LIFO: cross-action LIFO respects global order
+18. Build and test: `go build ./...` then `go test -race ./...`
+
+## Technical Requirements
+- File path: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/pool.go (NEW)
+- DisplacePolicy type is defined in config.go (already added in job 0300)
+- All timing fields use seconds (int), converted to time.Duration in code
+- Background expiry goroutine started in NewPoolManager (graceful cancellation TBD)
+- Queue length checks: queue size refers to number of items, not bytes
+- Displacement prefers non-forced items, within group prefers by KillOrder
+
+## Success Criteria
+- `go build ./...` succeeds
+- All 18+ unit tests pass: `go test -race pool_test.go pool.go`
+- TestPool_Unlimited passes: tasks start immediately without queue
+- TestPool_Queue_FIFO passes: FIFO order respected
+- TestPool_Queue_LIFO passes: LIFO order respected
+- TestPool_MaxAge_Expiry passes: expired items cleaned up
+- TestPool_Displace tests pass: displacement logic correct
+- TestPool_Forced tests pass: forced task preferential handling
+- TestPool_SetLimits_Excess passes: excess task handling correct
+- `go test -race ./...` passes all tests, no race conditions
+- Pool info reflects accurate running count and queue state
+
+## Expected Outcome
+pool.go is complete with full PoolManager implementation. Multi-layer concurrency control is functional: global limits, per-action limits, FIFO/LIFO queuing, smart displacement, age-based expiry, graceful drain. Ready for integration with Hub.Acquire() and Hub.Release() in hub.go refactoring.
+
+## Reference Information
+- Project root: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/
+- DisplacePolicy enum in config.go: "false", "true", "prohibit"
+- Current worker.go: see existing RunningEntry or similar struct for inspiration
+- Hub in hub.go will call PoolManager methods (to be integrated in separate job)
+- Test patterns: use short max_age (e.g., 100ms) for fast test execution
+
+## Notes & Warnings
+- Age-based expiry background goroutine timing is critical: must not block, must be accurate
+- Displacement logic is complex and error-prone: comprehensive tests essential
+- Forced task preferential treatment must be consistent across admission and displacement decisions
+- Global queue ordering (actionOrder slice) must be updated on every enqueue
+- Graceful shutdown (DrainAll) must not hang; may need context with timeout
+- Lazy expiry check in Dequeue() is optimization, but background sweep is primary
+- Test with short durations (ms, not seconds) for speed; scale appropriately in production

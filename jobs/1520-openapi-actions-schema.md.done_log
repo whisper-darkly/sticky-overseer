@@ -1,0 +1,41 @@
+# Job Completion Log: Add Dynamic OpenAPI Schema Generation for Registered Actions
+
+## Metadata
+- **Title**: Add Dynamic OpenAPI Schema Generation for Registered Actions
+- **Created**: 2026-02-21
+- **Priority**: medium
+- **Complexity**: medium
+- **Processing mode**: sequential
+
+## Accomplishments
+
+### New file: `openapi.go`
+- Added `BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte`
+- Generates Swagger 2.0 JSON from registered action handlers at request time
+- Each action maps to a POST path at `/actions/{actionName}/start`
+- `formData` parameters derived from `ParamSpec`: required params (Default==nil) first, optional with defaults after
+- Custom extensions: `x-action-type`, `x-task-pool` (when Limit>0 or Queue set), `x-retry`, `x-dedupe-key`
+- Tags list sorted alphabetically matching paths
+- CEL validation expressions preserved as `x-validate` on parameters
+- Fallback: returns minimal valid JSON on marshal error (no crash)
+
+### Modified: `transport.go`
+- Removed `//go:embed docs/swagger.json` and static `openAPISpec` var
+- `/openapi.json` handler now calls `BuildOpenAPISpec(hub.actions, version)` with proper `hub.mu.RLock()` guard
+- Pattern mirrors existing `/ws/manifest` handler
+
+### New file: `openapi_test.go`
+- `TestBuildOpenAPISpec_structure`: validates Swagger 2.0 envelope with nil actions
+- `TestBuildOpenAPISpec_actions`: verifies action paths, required/optional params, defaults, x-validate
+- `TestBuildOpenAPISpec_tags`: verifies alphabetically-sorted tags
+- `TestBuildOpenAPISpec_extensions`: verifies x-task-pool limit and x-dedupe-key
+
+## Test results
+```
+=== RUN   TestBuildOpenAPISpec_structure --- PASS
+=== RUN   TestBuildOpenAPISpec_actions   --- PASS
+=== RUN   TestBuildOpenAPISpec_tags      --- PASS
+=== RUN   TestBuildOpenAPISpec_extensions --- PASS
+ok  github.com/whisper-darkly/sticky-overseer/v2   8.794s
+ok  github.com/whisper-darkly/sticky-overseer/v2/exec  (cached)
+```

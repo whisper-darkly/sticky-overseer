@@ -1,0 +1,190 @@
+---
+title: Add actions.go with ActionHandler interfaces, factory registry, CEL engine
+created: 2026-02-21
+origin: sticky-overseer major architecture refactor — implementing pluggable action handler system with CEL validation
+priority: high
+complexity: high
+notes:
+  - ActionHandler is the core abstraction; all action drivers implement this interface
+  - Factory registry enables dynamic registration of action types at init() time
+  - CEL compilation must be fail-fast (startup validation, not runtime)
+  - mergeRetryPolicy: zero values do NOT override; omitted fields mean "use global"
+  - OutputContext CEL environment used by exec handler for output filtering
+  - --list-handlers command-line flag support (called early in main, exits without connecting to DB/hub)
+---
+
+Follow exactly and without stopping:
+
+## Task: Add actions.go with ActionHandler interfaces, factory registry, CEL engine
+
+## Background & Context
+The refactor introduces named actions — pluggable executors that implement a common interface. Actions are registered via a factory pattern:
+- Each action type (e.g., "exec", custom handlers) implements ActionHandlerFactory
+- Factories are registered at init() time
+- Hub calls buildActionHandlers() to instantiate handlers from config
+- Each handler validates parameters using CEL, starts workers, and describes itself
+
+CEL (Common Expression Language) is used for:
+- Parameter validation: `params:value in ['foo', 'bar']`
+- Output filtering: `output.stream == 'stdout' && output.data.contains('ERROR')`
+
+actions.go provides:
+- ActionHandler interface (Describe, Validate, Start)
+- ActionHandlerFactory interface (Type, Create)
+- Factory registry and buildActionHandlers()
+- CEL compilation and evaluation helpers
+- Support for `--list-handlers` command-line introspection
+
+## Problem Description
+Current architecture has no action abstraction; workers are started directly via Command+Args. New architecture requires:
+- Pluggable action handlers with consistent interface
+- Parameter validation via CEL expressions
+- Per-action retry and pool configuration
+- Dynamic handler instantiation from config
+- Ability to list available action types for introspection
+
+## Implementation Plan
+1. Create /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/actions.go
+2. Define ActionHandler interface:
+   ```go
+   type ActionHandler interface {
+       Describe() ActionInfo
+       Validate(params map[string]string) error
+       Start(taskID string, params map[string]string, cb workerCallbacks) (*Worker, error)
+   }
+   ```
+3. Define ActionHandlerFactory interface:
+   ```go
+   type ActionHandlerFactory interface {
+       Type() string
+       Create(config map[string]any, actionName string, mergedRetry RetryPolicy, poolCfg PoolConfig) (ActionHandler, error)
+   }
+   ```
+4. Define ActionInfo struct:
+   ```go
+   type ActionInfo struct {
+       Name        string                // action key from config (set by Hub, not driver)
+       Type        string                // driver type string, e.g. "exec"
+       Description string
+       Params      map[string]*ParamSpec // nil = not config-described
+       TaskPool    PoolConfig
+       Retry       *RetryPolicy
+   }
+   ```
+5. Implement factory registry:
+   ```go
+   var factoryRegistry []ActionHandlerFactory
+   
+   func RegisterFactory(f ActionHandlerFactory) {
+       factoryRegistry = append(factoryRegistry, f)
+   }
+   ```
+6. Implement buildActionHandlers():
+   ```go
+   func buildActionHandlers(cfg *Config) (map[string]ActionHandler, error)
+   ```
+   Logic:
+   - For each action in cfg.Actions:
+     - Look up factory by actionConfig.Type in registry
+     - Return error if factory not found (unknown action type)
+     - Compute merged retry: mergeRetryPolicy(cfg.Retry, actionConfig.Retry)
+     - Call factory.Create(actionConfig.Config, actionName, mergedRetry, actionConfig.TaskPool)
+     - Store in result map with action name as key
+     - Return error if Create fails
+   - Return map[string]ActionHandler with all handlers, or error
+7. Implement mergeRetryPolicy():
+   ```go
+   func mergeRetryPolicy(global, override RetryPolicy) RetryPolicy
+   ```
+   Logic:
+   - Start with global as baseline
+   - For override.RestartDelay: if non-zero, use it; else keep global
+   - For override.ErrorWindow: if non-zero, use it; else keep global
+   - For override.ErrorThreshold: if non-zero, use it; else keep global
+   - Return merged result
+8. Implement CEL compilation and evaluation helpers:
+   ```go
+   // CompileCELProgram compiles a CEL expression with variable "value" (string).
+   // Returns (nil, nil) if expr is empty string.
+   // Returns error if expression is invalid.
+   func CompileCELProgram(expr string) (cel.Program, error)
+   
+   // EvalCELBool evaluates compiled program with value=input.
+   // Returns bool result of evaluation.
+   // Error if program is nil (no validation = always pass).
+   func EvalCELBool(prog cel.Program, input string) (bool, error)
+   ```
+9. Implement output context CEL environment:
+   ```go
+   type OutputContext struct {
+       Stream string
+       Data   string
+       JSON   map[string]any  // nil if Data is not valid JSON
+   }
+   
+   // CompileOutputCELProgram compiles CEL with output.Stream, output.Data, output.JSON.
+   // Returns (nil, nil) if expr is empty.
+   func CompileOutputCELProgram(expr string) (cel.Program, error)
+   ```
+10. Implement --list-handlers support:
+    ```go
+    func ListHandlers() {
+        for _, factory := range factoryRegistry {
+            fmt.Println(factory.Type())
+        }
+    }
+    ```
+11. Write unit tests:
+    - TestRegisterFactory: register stub factory, verify in registry
+    - TestRegisterFactory_Multiple: register several factories, all present in order
+    - TestBuildActionHandlers_UnknownType: unknown action type → error
+    - TestBuildActionHandlers_Success: valid config → handlers map with correct types
+    - TestMergeRetryPolicy_GlobalDefaults: empty override keeps global
+    - TestMergeRetryPolicy_OverrideNonZero: non-zero override values replace global
+    - TestMergeRetryPolicy_Zero_Ignored: zero values do NOT override
+    - TestCompileCELProgram_Valid: valid expression compiles
+    - TestCompileCELProgram_Invalid: bad syntax → error
+    - TestCompileCELProgram_Empty: empty string → nil program, nil error
+    - TestEvalCELBool_Valid: simple expressions evaluate correctly
+    - TestCompileOutputCELProgram_Valid: compiles with output context variables
+    - TestCompileOutputCELProgram_JSON: JSON parsing creates output.JSON map
+12. Build and test: `go build ./...` then `go test -race ./...`
+
+## Technical Requirements
+- File path: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/actions.go (NEW)
+- Dependencies: google.golang.org/cel (added in job 0100)
+- workerCallbacks type is defined in worker.go (use it as parameter type)
+- parserCallbacks must match worker.go interface signature
+- CEL environment variables: "value" (string) for params, "output" (OutputContext) for filtering
+- Factory registry is module-level package var, accessed via RegisterFactory() and buildActionHandlers()
+
+## Success Criteria
+- `go build ./...` succeeds
+- TestRegisterFactory passes: factory appears in registry
+- TestBuildActionHandlers_UnknownType passes: unknown type → error
+- TestBuildActionHandlers_Success passes: config → correct handlers map
+- TestMergeRetryPolicy tests pass: merging logic correct
+- TestCompileCELProgram_Invalid passes: syntax error → error
+- TestCompileCELProgram_Empty passes: empty string → (nil, nil)
+- TestEvalCELBool tests pass: expressions evaluate correctly
+- TestCompileOutputCELProgram passes: output context available
+- `go test -race ./...` passes all tests
+- No race conditions in factory registry access
+
+## Expected Outcome
+actions.go is complete with factory registry, CEL engine, and buildActionHandlers(). Ready for integration with handler_exec.go (job 0500) and hub.go startup sequence. CEL compilation validated at startup (fail-fast for config errors). Factory pattern enables pluggable action types.
+
+## Reference Information
+- Project root: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/
+- CEL library docs: https://github.com/google/cel-go
+- CEL expression syntax: https://github.com/google/cel-spec/blob/master/doc/langdef.md
+- workerCallbacks interface in worker.go: see existing code for signature
+- PoolConfig type will be in pool.go (job 0600)
+
+## Notes & Warnings
+- CEL compilation MUST be fail-fast: do not defer validation to runtime
+- Empty CEL expression ("") means no validation; always pass (return nil error in Validate)
+- mergeRetryPolicy: zero values mean "not specified"; they do NOT override global defaults
+- Factory lookup by Type() string must be exact match; report "unknown action type" error clearly
+- RegisterFactory is thread-unsafe (only called at init() time before Hub starts); no mutex needed
+- CEL evaluation errors should be reported in Validate() to fail early, not at Start() time

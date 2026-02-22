@@ -1,0 +1,11 @@
+title: Formalize WS Manifest schema and commit to sticky-bb
+completed: 2026-02-21
+mode: sequential
+verification: ✓ JSON files validated with python3 -m json.tool
+git_commit: 7c119fb (sticky-bb)
+
+Accomplishments:
+- Created docs/ws-manifest-spec.md — canonical v1.0 specification
+- Created docs/ws-manifest.schema.json — JSON Schema draft/2020-12 meta-schema
+- Created docs/ws-manifest-overseer-example.json — complete protocol example with 18 types, 30 messages, 13 operations
+- Committed to sticky-bb git

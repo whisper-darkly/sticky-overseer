@@ -1,0 +1,285 @@
+---
+title: Add config-driven duplicate task detection via DedupeKey parameter combinations
+created: 2026-02-21
+origin: Owner directive — named actions should be able to specify which parameter combination uniquely identifies a task instance. A second start with the same combination returns the existing task_id instead of starting a duplicate.
+priority: medium
+complexity: medium
+notes:
+  - Prerequisites: Jobs 1350 (hub cleanup) and 1365 (TOCTOU fix) must be complete
+  - Dedup check must integrate with the atomic pending map introduced in job 1365
+  - DedupeKey specifies which parameter names form the unique identifier
+  - When DedupeKey is empty/nil, deduplication is inactive (default behavior)
+  - Native Go drivers can programmatically set DedupeKey=nil to opt out
+  - Fingerprint must include action name + sorted parameter values for stability
+  - Must check both running tasks (h.tasks) and queued tasks (via pool.Info())
+---
+
+Follow exactly and without stopping:
+
+## Task: Add config-driven duplicate task detection via DedupeKey parameter combinations
+
+## Background & Context
+
+The sticky-overseer currently allows an unlimited number of simultaneous tasks with the same action and identical parameters. This creates a problem for users running named actions: if a client accidentally sends duplicate `start` messages or if a process restarts and retries, multiple identical tasks spawn unnecessarily, consuming resources and creating confusion in task tracking.
+
+The desired behavior is to allow action authors to declare which parameter combinations uniquely identify a task. When a second `start` message arrives with those same parameter values, the system returns the existing task_id instead of creating a duplicate, effectively providing idempotent task creation.
+
+This feature must be optional (DedupeKey empty/nil means no deduplication) and must integrate cleanly with the atomic pending map introduced in job 1365 to avoid TOCTOU races where the same task fingerprint could be started twice during the time window between the dedup check and the actual worker spawn.
+
+## Problem Description
+
+Symptoms:
+- Users accidentally start duplicate tasks by retrying or misconfiguring clients
+- No way for action authors to express task uniqueness constraints
+- Multiple identical transcoding jobs run simultaneously, wasting compute resources
+- Task lists become cluttered with redundant entries that differ only in task_id
+
+Current state: Any number of tasks with `action=transcode, input_file=video.mp4, output_format=h264` can be started independently.
+
+Desired state: If an action has `dedupe_key: ["input_file", "output_format"]`, starting a second task with those same parameter values immediately returns the existing task_id and an error message indicating the duplicate.
+
+How this integrates with job 1365: The pending map (introduced in 1365) tracks task_ids that are queued and not yet started. The dedup check must consult both the running tasks (h.tasks) and the pending map to avoid races where two identical tasks could both pass the dedup check before either reaches the worker spawn phase.
+
+## Implementation Plan
+
+### Task 1: Add DedupeKey to ActionConfig (config.go)
+
+1. Open /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go
+2. Locate the `ActionConfig` struct definition
+3. Add a new field after the `TaskPool` field:
+   ```go
+   DedupeKey []string `yaml:"dedupe_key"` // param names that form unique key; nil/empty = no dedup
+   ```
+4. This field will be unmarshalled from YAML config files, allowing action authors to specify which parameters form the uniqueness key
+5. Verify the struct compiles correctly
+
+### Task 2: Add DedupeKey to ActionInfo (actions.go)
+
+1. Open /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/actions.go
+2. Locate the `ActionInfo` struct definition (used in API responses)
+3. Add a new field after the `Retry` field:
+   ```go
+   DedupeKey []string `json:"dedupe_key,omitempty"` // nil = dedup inactive
+   ```
+4. Find where `ActionInfo` is populated in the `ExecHandler.Describe()` method
+5. Copy the DedupeKey from the underlying ActionConfig to the returned ActionInfo:
+   ```go
+   DedupeKey: h.config.DedupeKey,
+   ```
+   (or similar depending on how ExecHandler stores the config)
+6. Verify that API responses now include the dedupe_key field when present
+
+### Task 3: Implement dedupe fingerprint helper in hub.go
+
+1. Open /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/hub.go
+2. Add a new helper function (place it before or after the existing helper functions in the file):
+   ```go
+   // dedupeFingerprint builds a stable fingerprint from action name + specific param values.
+   // Returns "" if dedupeKey is empty (dedup inactive).
+   func dedupeFingerprint(action string, params map[string]string, dedupeKey []string) string {
+       if len(dedupeKey) == 0 {
+           return ""
+       }
+       // Sort keys for stability across multiple invocations
+       keys := make([]string, len(dedupeKey))
+       copy(keys, dedupeKey)
+       sort.Strings(keys)
+       
+       var parts []string
+       parts = append(parts, action)
+       for _, k := range keys {
+           parts = append(parts, k+"="+params[k])
+       }
+       return strings.Join(parts, "\x00")
+   }
+   ```
+3. This function must be deterministic: the same action + param values always produce the same fingerprint
+4. Using sort.Strings ensures the fingerprint doesn't depend on the order of dedupeKey in the config
+5. Using "\x00" as a separator prevents collisions (e.g., "action=a,b=c" vs "action=ab,=c")
+
+### Task 4: Implement dedup check in handleStart (hub.go)
+
+1. Open /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/hub.go
+2. Locate the `handleStart` method
+3. After handler.Validate() succeeds and before the TOCTOU pending check (from job 1365), add the dedup check:
+   ```go
+   // Dedup check: scan running tasks for matching fingerprint
+   info := handler.Describe()
+   if fp := dedupeFingerprint(action, params, info.DedupeKey); fp != "" {
+       h.mu.RLock()
+       for _, existing := range h.tasks {
+           existing.mu.Lock()
+           running := existing.worker != nil && existing.worker.State == WorkerRunning
+           existingFP := dedupeFingerprint(existing.record.Action, existing.record.Params, info.DedupeKey)
+           existing.mu.Unlock()
+           if running && existingFP == fp {
+               h.mu.RUnlock()
+               // Return error with the existing task_id for client correlation
+               h.sendError(conn, msg.ID, fmt.Sprintf("duplicate task: already running as %s", existing.record.TaskID))
+               return
+           }
+       }
+       h.mu.RUnlock()
+   }
+   ```
+4. This check:
+   - Only runs if a fingerprint is computed (i.e., DedupeKey is non-empty)
+   - Holds h.mu.RLock to safely iterate h.tasks
+   - Locks each task individually to check its worker state and compute fingerprint
+   - Returns an error immediately if a running task with matching fingerprint is found
+   - Includes the existing task_id in the error message for client correlation
+
+### Task 5: Update error response to include existing task_id (hub.go)
+
+1. Open /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/messages.go
+2. Locate the `ErrorMessage` struct definition
+3. Add a new field to capture the existing task_id:
+   ```go
+   ExistingTaskID string `json:"existing_task_id,omitempty"` // set on duplicate detection
+   ```
+4. Back in hub.go, modify the dedup check error response to use a structured error:
+   Instead of `h.sendError(conn, msg.ID, fmt.Sprintf("duplicate task: already running as %s", existing.record.TaskID))`, create an ErrorMessage with the ExistingTaskID field set
+5. Update the sendError method signature if needed to accept the structured ErrorMessage, or add a new sendErrorWithTaskID method
+6. This allows clients to programmatically extract the existing task_id from the error response
+
+### Task 6: Check queued tasks via pool fingerprints (hub.go)
+
+1. The dedup check in Task 4 only examines running tasks in h.tasks. It must also check queued tasks.
+2. Open /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/pool.go
+3. Add a new field to `PoolManager`:
+   ```go
+   fingerprints map[string]string // taskID → dedup fingerprint for queued items
+   ```
+4. Initialize this map in PoolManager.New() or the pool constructor
+5. When a task is enqueued in handleStart (after job 1365 integration), store the fingerprint:
+   ```go
+   if fp := dedupeFingerprint(action, params, info.DedupeKey); fp != "" {
+       pool.mu.Lock()
+       pool.fingerprints[taskID] = fp
+       pool.mu.Unlock()
+   }
+   ```
+6. After the running-task dedup check in hub.go handleStart, add a queued-task check:
+   ```go
+   // Check queued tasks
+   if fp != "" {
+       pool.mu.RLock()
+       for queuedID, queuedFP := range pool.fingerprints {
+           if queuedFP == fp {
+               pool.mu.RUnlock()
+               h.sendError(conn, msg.ID, fmt.Sprintf("duplicate task: already queued as %s", queuedID))
+               return
+           }
+       }
+       pool.mu.RUnlock()
+   }
+   ```
+7. When a queued task begins execution (moves from pending to running), remove its fingerprint from the pool.fingerprints map
+8. When a task exits or is stopped, remove its fingerprint if present
+
+### Task 7: Integration with job 1365 pending map
+
+1. This job's dedup logic must work in concert with job 1365's atomic pending map
+2. The sequence in handleStart should be:
+   a. Validate action and parameters
+   b. Dedup check on running tasks (Task 4)
+   c. Dedup check on queued tasks (Task 6)
+   d. Add to pending map and spawn worker atomically (from job 1365)
+3. Ensure no task fingerprint can appear in both the dedup check and the pending add—i.e., once a task is added to pending, subsequent dedup checks immediately see it as a duplicate
+
+### Task 8: Write unit tests
+
+1. Create tests in hub_test.go or a new file dedupe_test.go
+2. Test cases:
+   a. dedupeFingerprint returns "" when dedupeKey is empty
+   b. dedupeFingerprint returns same value for identical inputs (determinism)
+   c. dedupeFingerprint returns different values for different inputs
+   d. dedupeFingerprint is stable regardless of param key order
+   e. handleStart returns duplicate error when second task matches running task fingerprint
+   f. handleStart returns duplicate error when second task matches queued task fingerprint
+   g. handleStart succeeds when dedupeKey is nil/empty (dedup inactive)
+   h. handleStart succeeds when second task has different parameter values
+3. Use table-driven tests for clarity
+
+### Task 9: Update documentation
+
+1. Add to CLAUDE.md or create a new docs/deduplication.md file documenting:
+   - How to declare DedupeKey in action YAML config
+   - Behavior when dedup is active vs inactive
+   - Error response format when duplicate detected
+   - How clients should handle duplicate-detection errors
+2. Include the example YAML config in documentation:
+   ```yaml
+   actions:
+     transcode:
+       type: exec
+       dedupe_key: ["input_file", "output_format"]  # same input+format = duplicate
+       config:
+         entrypoint: /usr/bin/ffmpeg
+         command: ["-i", "[[input_file]]", "-f", "[[output_format]]", "[[output_file]]"]
+   ```
+
+## Technical Requirements
+
+File paths:
+- /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go (ActionConfig struct)
+- /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/actions.go (ActionInfo struct, ExecHandler.Describe())
+- /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/hub.go (handleStart, dedupeFingerprint helper, dedup checks)
+- /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/pool.go (PoolManager.fingerprints map)
+- /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/messages.go (ErrorMessage struct)
+
+Dependencies:
+- Job 1350 (hub cleanup) — must be complete before this job starts
+- Job 1365 (TOCTOU fix) — atomic pending map must be in place to avoid races
+- Go 1.19+ (for standard library: strings, sort, fmt)
+- Existing WorkerRunning constant or State type from worker.go
+
+Commands to test:
+- `make build` to compile after changes
+- `go test -race ./...` to run tests and detect races
+- `go vet ./...` for static analysis
+- Manual testing: start task with same action+params twice, verify second returns duplicate error with existing task_id
+
+Reference implementations:
+- See ExecHandler.Describe() in actions.go for pattern of populating ActionInfo fields
+- See existing error handling in handleStart for response format patterns
+- See pool.Info() in pool.go for queued task enumeration
+
+## Success Criteria
+
+1. ActionConfig and ActionInfo both have DedupeKey fields populated from config
+2. dedupeFingerprint function is deterministic and handles empty dedupeKey correctly
+3. handleStart checks running tasks for duplicate fingerprint before spawning worker
+4. handleStart checks queued tasks for duplicate fingerprint before spawning worker
+5. Second start with duplicate fingerprint returns error with existing task_id
+6. Error response includes existing_task_id field in JSON
+7. When dedupeKey is nil/empty, deduplication is inactive and duplicates are allowed
+8. All dedup checks are race-free (hold appropriate locks)
+9. Unit tests pass with 100% coverage of dedup logic
+10. `go test -race ./...` passes without race detector warnings
+11. Documentation includes example YAML config and API behavior
+
+## Expected Outcome
+
+When complete, action authors can declare dedup constraints in action YAML config via the `dedupe_key` field. When a client sends a second `start` message with the same values for those parameters, the server returns an immediate error with the existing task_id instead of spawning a duplicate. Queued and running tasks are both checked. The feature is backward compatible: actions without dedupe_key continue to allow unlimited simultaneous tasks.
+
+## Reference Information
+
+- Action configuration: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go
+- Action info struct: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/actions.go
+- Hub message handling: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/hub.go
+- Pool management: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/pool.go
+- Message types: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/messages.go
+- Related job: 1365 (TOCTOU fix with atomic pending map)
+- Related job: 1350 (hub cleanup)
+- Protocol documentation: CLAUDE.md WebSocket protocol section
+
+## Notes & Warnings
+
+- The dedup check is inherently subject to small races with the pending map from job 1365. Integration is critical: the dedup check + pending map add must be atomic or the check must consult the pending map immediately before spawning.
+- Fingerprints must be stable across invocations: use sort.Strings to ensure consistent ordering.
+- Lock ordering is important: always acquire h.mu before individual task.mu to avoid deadlock.
+- When removing queued tasks from the pool, also remove their fingerprints.
+- Consider performance: if h.tasks or pool.fingerprints becomes very large, the dedup scan could become slow. For now, a linear scan is acceptable; future optimization could use a map from fingerprint → task_id.
+- The params passed to handleStart are typically map[string]string; ensure type consistency when building fingerprints from Params fields in TaskRecord.
+- Test both the successful dedup case (duplicate rejected) and the non-dedup case (DedupeKey nil/empty allows unlimited tasks).

@@ -1,0 +1,93 @@
+---
+title: Add IncludeStdout/IncludeStderr to workerConfig in worker.go
+created: 2026-02-21
+origin: sticky-overseer major architecture refactor - stream filtering support
+priority: medium
+complexity: medium
+notes:
+  - Must not break existing worker behavior when both flags are true
+  - Worker must drain pipes even when output is not emitted
+  - Tests must verify silent consumption of filtered streams
+  - No changes needed to Hub or other components for this job
+---
+
+Follow exactly and without stopping:
+
+## Task: Add IncludeStdout/IncludeStderr to workerConfig in worker.go
+
+## Background & Context
+
+As part of the sticky-overseer architecture refactor, actions are being introduced with configurable output rules. Different action handlers may need to suppress stdout, stderr, or both from being forwarded to connected clients. The worker component needs to support filtering output streams at the source while still properly draining pipes to prevent process blocking.
+
+Currently, the Worker always emits all output events from both stdout and stderr. This change adds configuration options to suppress output callbacks for specific streams while maintaining proper pipe drainage (critical for process stability).
+
+## Problem Description
+
+The current worker implementation has no mechanism to suppress output from specific streams. During the refactor, action handlers may be configured to not forward certain streams (e.g., a background service might suppress stderr for benign logging). Without this filtering capability:
+- All output gets forwarded regardless of configuration
+- Action handlers must implement their own filtering logic
+- The architecture lacks proper stream control at the transport layer
+
+## Implementation Plan
+
+1. Add two boolean fields to the `workerConfig` struct in worker.go:
+   - `IncludeStdout bool` - if false, stdout lines are not emitted upstream
+   - `IncludeStderr bool` - if false, stderr lines are not emitted upstream
+
+2. Modify the stdout reading goroutine (in `startWorker` function):
+   - Continue draining the pipe regardless of `IncludeStdout` value
+   - Only call the output callback when `config.IncludeStdout == true`
+   - Add comment explaining pipe must be drained to prevent process blocking
+
+3. Modify the stderr reading goroutine (in `startWorker` function):
+   - Continue draining the pipe regardless of `IncludeStderr` value
+   - Only call the output callback when `config.IncludeStderr == true`
+   - Add comment explaining pipe must be drained to prevent process blocking
+
+4. Ensure backward compatibility:
+   - Default behavior (zero values = false for both) is silent consumption
+   - Existing code must explicitly set `IncludeStdout: true` and `IncludeStderr: true` to get current behavior
+   - Document this clearly in comments
+
+5. Add test cases covering all combinations
+
+## Technical Requirements
+
+- File location: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/worker.go`
+- Modify struct: `workerConfig`
+- Modify function: `startWorker()` goroutine logic for stdout and stderr readers
+- No changes to `Worker` struct or other public interfaces
+- The exec handler (job 05) will set these flags based on output rule configuration
+
+## Success Criteria
+
+- `go build ./...` from project root succeeds
+- All existing worker tests pass: `go test -race ./...`
+- New test `TestWorker_IncludeStdout_False`: Create worker with IncludeStdout=false, IncludeStderr=true. Verify:
+  - No output events received for stdout lines
+  - Stderr lines ARE received and emitted
+  - Process completes successfully
+- New test `TestWorker_IncludeStderr_False`: Create worker with IncludeStdout=true, IncludeStderr=false. Verify:
+  - Stdout lines ARE received and emitted
+  - No output events received for stderr lines
+  - Process completes successfully
+- New test `TestWorker_BothInclude_True`: Create worker with both flags true. Verify:
+  - All output from both streams is emitted (existing behavior)
+  - Process works as before
+
+## Expected Outcome
+
+The worker.go component will support stream filtering without process blocking. The exec handler can configure per-action whether stdout, stderr, or both should be forwarded to clients. Filtered streams are silently consumed by the worker to prevent pipe buffer overflow.
+
+## Reference Information
+
+- Current worker.go location: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/worker.go`
+- Related job 05: Exec handler implementation that will use these flags
+- Related job 10: Hub refactor that integrates handler output configuration
+- Command to test: `go test -race ./... -run TestWorker`
+
+## Notes & Warnings
+
+- Pipes MUST be drained even when output is filtered, or the process will block on write
+- This is a foundation for action-based output rules, so test thoroughly
+- The output callbacks should not be invoked for filtered streams, saving bandwidth and processing

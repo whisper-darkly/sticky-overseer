@@ -1,0 +1,188 @@
+---
+title: Fix ParamSpec JSON tags and handler_exec template delimiter conflict
+created: 2026-02-21
+origin: Post-audit improvement plan — Informational I7 (ParamSpec fields marshalled with capitalized names) and Medium M3 (template delimiter conflicts with shell/JSON syntax)
+priority: medium
+complexity: low
+notes:
+  - Three focused changes to improve API consistency and template safety
+  - ParamSpec JSON marshalling currently uses capitalized field names (Default/Validate)
+  - Template delimiters "{" and "}" conflict with shell variable syntax and JSON braces
+  - New delimiter syntax "[[" and "]]" avoids all common syntax conflicts
+  - All test cases use old "{paramName}" syntax and must be updated
+---
+
+Follow exactly and without stopping:
+
+## Task: Fix ParamSpec JSON tags and handler_exec template delimiter conflict
+
+## Background & Context
+During post-audit review of the sticky-overseer API and template system, two issues were identified:
+
+1. **ParamSpec JSON marshalling inconsistency (I7 - Informational)**: The ParamSpec struct in config.go lacks JSON tags, causing its fields to be marshalled with capitalized names ("Default" and "Validate") instead of snake_case ("default" and "validate"). This violates REST API conventions where clients receiving ActionsMessage with ActionInfo.Params see inconsistent field naming compared to all other JSON message fields.
+
+2. **Template delimiter syntax conflict (M3 - Medium)**: The handler_exec.go template system uses Delims("{", "}") for parameter substitution. This conflicts with shell syntax (${VAR}), JSON object notation {}, and command argument syntax that commonly uses braces. The delimiter choice also contradicts the code comment which states "{. and }" but the implementation uses just "{" and "}".
+
+These changes improve API contract consistency and reduce accidental template conflicts in shell/JSON arguments.
+
+## Problem Description  
+**Current ParamSpec JSON output:**
+- Clients receive `{"Default": "value", "Validate": "expr"}` instead of `{"default": "value", "validate": "expr"}`
+- This inconsistency breaks API contract where most fields use snake_case
+- Breaks client-side type definitions that expect lowercase field names
+
+**Current template delimiter issues:**
+- Template syntax {paramName} conflicts with shell expansion ${paramName}
+- Conflicts with JSON/JavaScript object literal syntax {key: value}
+- Comment at line ~253 says "{. and }" but code uses "{" and "}" — documentation mismatch
+- Any command argument containing JSON or shell braces will be incorrectly parsed as a template
+
+**Discovery context:**
+- Found during comprehensive code audit reviewing API consistency
+- Affects all action parameter metadata sent to clients via describe message
+- Affects all exec handler configurations that use parameter templates
+- Existing tests use old syntax and will fail after delimiter change
+
+## Implementation Plan
+1. Add JSON tags to ParamSpec struct (config.go lines 44-47)
+2. Update renderTemplate function to use [[ and ]] delimiters (handler_exec.go line 264-265)
+3. Update renderTemplate function comment to reflect new delimiter syntax (handler_exec.go lines 258-263)
+4. Update all test cases in handler_exec_test.go to use [[paramName]] syntax
+5. Update ExecHandlerConfig comments if they mention old delimiter syntax
+
+## Technical Requirements
+- Files to modify:
+  - /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go (lines 44-47)
+  - /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/handler_exec.go (lines 20-24, 153-163, 258-263, 264-265)
+  - /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/handler_exec_test.go (lines 199, 239, 268, 319, 339, 360)
+- Dependencies: Go text/template package (already in use)
+- Test command: `go test -race ./...` to verify all tests pass
+- Build verification: `make build` to confirm compilation succeeds
+
+## Task 1: Fix ParamSpec JSON tags (config.go)
+
+Current code (lines 44-47):
+```go
+type ParamSpec struct {
+	Default  *string // nil = required parameter
+	Validate string  // CEL expression; empty = no validation
+}
+```
+
+Change to:
+```go
+type ParamSpec struct {
+	Default  *string `json:"default,omitempty" yaml:"-"`  // nil = required parameter
+	Validate string  `json:"validate,omitempty" yaml:"-"` // CEL expression; empty = no validation
+}
+```
+
+**Reasoning:**
+- json:"default,omitempty" ensures fields marshal as lowercase "default" and "validate"
+- yaml:"-" tells YAML parser to skip these struct tags since ParamSpec.UnmarshalYAML handles parsing manually
+- This maintains the existing custom YAML unmarshalling behavior while fixing JSON output
+
+## Task 2: Fix template delimiter (handler_exec.go)
+
+Update renderTemplate function (line 264-265):
+
+Current:
+```go
+func renderTemplate(tmpl string, data map[string]string) (string, error) {
+	t, err := template.New("").Delims("{", "}").Parse(tmpl)
+```
+
+Change to:
+```go
+func renderTemplate(tmpl string, data map[string]string) (string, error) {
+	t, err := template.New("").Delims("[[", "]]").Parse(tmpl)
+```
+
+Update the comment block above renderTemplate (lines 258-263):
+
+Current:
+```
+// renderTemplate executes a Go text/template string using custom delimiters
+// {. and } (instead of the default {{ and }}) so that template syntax does not
+// conflict with shell variable syntax (e.g. ${VAR} or ${{VAR}}).
+//
+// The data map is passed directly as the template dot value; parameter values
+// are accessed as {.paramName} in the template string.
+```
+
+Change to:
+```
+// renderTemplate executes a Go text/template string using custom delimiters
+// [[ and ]] (instead of the default {{ and }}) so that template syntax does not
+// conflict with shell variable syntax (e.g. ${VAR}), JSON notation, or command braces.
+//
+// The data map is passed directly as the template dot value; parameter values
+// are accessed as [[.paramName]] in the template string.
+```
+
+Update ExecHandlerConfig comments (lines 20-24):
+
+Current:
+```go
+	// Entrypoint is the executable to run. Supports {. } template syntax.
+	Entrypoint string `json:"entrypoint"`
+
+	// Command is the argument list passed to Entrypoint. Each element supports
+	// {. } template syntax with the resolved parameter map as data.
+```
+
+Change to:
+```go
+	// Entrypoint is the executable to run. Supports [[ ]] template syntax.
+	Entrypoint string `json:"entrypoint"`
+
+	// Command is the argument list passed to Entrypoint. Each element supports
+	// [[ ]] template syntax with the resolved parameter map as data.
+```
+
+## Task 3: Update all test cases to use new delimiter syntax (handler_exec_test.go)
+
+Find and update all template syntax references from {.paramName} to [[.paramName]]:
+
+Line 199: `Command: []string{"{.msg}"}` → `Command: []string{"[[.msg]]"}`
+Line 239: `Command: []string{"{.unclosed"}` → `Command: []string{"[[.unclosed"}` (malformed template, now with new delimiter)
+Line 268: `"command": []any{"echo", "{.msg}"}` → `"command": []any{"echo", "[[.msg]]"}`
+Line 319: `renderTemplate("hello {.name}"` → `renderTemplate("hello [[.name]]"`
+Line 339: `renderTemplate("{.a}-{.b}-{.c}"` → `renderTemplate("[[.a]]-[[.b]]-[[.c]]"`
+Line 360: No change needed (uses $BAR without braces, not affected by delimiter change)
+
+Update test comment at line 237:
+Current: `// An unclosed {. delimiter causes a template parse error.`
+Change to: `// An unclosed [[ delimiter causes a template parse error.`
+
+## Success Criteria
+- All three files compile without errors
+- `go test -race ./...` passes with 100% of tests passing
+- ParamSpec JSON marshalling produces lowercase field names ("default", "validate")
+- Template rendering uses [[paramName]] syntax
+- No regression in functionality or performance
+- All existing functionality preserved
+
+## Expected Outcome
+- API consistency improved: all JSON fields use snake_case naming convention
+- Template safety improved: [[ ]] delimiters avoid conflicts with shell syntax, JSON, and common command arguments
+- Code documentation accurate: comments correctly describe syntax used
+- All tests updated to use new syntax and passing
+- No breaking changes to functionality, only output format
+
+## Reference Information
+- ParamSpec struct: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go lines 44-47, 49-81
+- renderTemplate function: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/handler_exec.go lines 254-274
+- ExecHandlerConfig struct: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/handler_exec.go lines 16-36
+- Test file: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/handler_exec_test.go (entire file)
+- Related test commands:
+  - `go test -race ./...`
+  - `make build`
+- Documentation: CLAUDE.md describes architecture including messages.go and handler_exec.go
+
+## Notes & Warnings
+- The delimiter change from { } to [[ ]] is backward incompatible for existing configurations that use template syntax
+- All configuration files or tests using {paramName} syntax must be updated to [[paramName]]
+- The yaml:"-" tag tells Go's YAML package to ignore struct tags during unmarshalling, allowing the custom UnmarshalYAML method to handle parsing
+- Tests at lines 318-367 specifically test renderTemplate behavior and must be updated with new syntax
+- Verify no other files reference the old delimiter syntax via: grep -r "{\..*}" /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/

@@ -1,8 +1,6 @@
 package overseer
 
 import (
-	_ "embed"
-
 	"bufio"
 	"context"
 	"encoding/json"
@@ -20,11 +18,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-//go:embed docker/playground.html
-var playgroundHTML []byte
-
-//go:embed docs/swagger.json
-var openAPISpec []byte
+// openAPISpec is no longer a static embed — /openapi.json is generated dynamically
+// by BuildOpenAPISpec from the registered action handlers at request time.
 
 // Conn represents a single client connection regardless of the underlying transport.
 // Implementations must be safe for concurrent ReadJSON calls from one goroutine
@@ -146,16 +141,17 @@ func (t tcpTransport) Listen(ctx context.Context) (<-chan Conn, error) {
 
 	mux := http.NewServeMux()
 
-	// Serve playground at "/".
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(playgroundHTML)
-	})
-
-	// Serve OpenAPI spec.
+	// Serve OpenAPI spec — generated dynamically from registered action handlers.
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
+		var actions map[string]ActionHandler
+		if t.hub != nil {
+			t.hub.mu.RLock()
+			actions = t.hub.actions
+			t.hub.mu.RUnlock()
+		}
+		spec := BuildOpenAPISpec(actions, t.version)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(openAPISpec)
+		w.Write(spec) //nolint:errcheck
 	})
 
 	// Serve WS Manifest.

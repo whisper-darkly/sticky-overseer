@@ -1,0 +1,23 @@
+---
+title: "Verify Batch A: worker/transport/config fixes"
+created: 2026-02-21
+origin: Batch verification checkpoint between A (1300-1320) and B (1330-1340)
+priority: high
+complexity: low
+notes:
+  - GATE: Batch B must not start until this passes
+  - Jobs verified: 1300 (process groups + scanner), 1310 (transport shutdown), 1320 (config/template)
+---
+
+Run the following checks. If any fail, stop immediately and report the error — do NOT continue.
+
+```bash
+cd /home/mmulligan/Development/whisper-darkly-github/sticky-overseer
+go build ./...
+go vet ./...
+go test -race ./... -timeout 120s
+```
+
+If all three commands exit 0, print "✅ Batch A verified — proceeding to Batch B" and finish.
+
+If any command fails, print the full output and stop with a non-zero exit so the job is marked as an error.

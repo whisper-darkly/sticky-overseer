@@ -1,0 +1,150 @@
+---
+title: Update store.go to schema v3 with Action+Params, v2→v3 migration
+created: 2026-02-21
+origin: sticky-overseer architecture refactor - action-based task model
+priority: high
+complexity: high
+notes:
+  - This is a breaking schema change requiring database migration
+  - Old command+args model becomes action+params
+  - Migration must preserve existing task records
+  - Must handle both fresh install (v3) and upgrade (v2→v3)
+  - Params stored as JSON string in database, decoded to map on read
+---
+
+Follow exactly and without stopping:
+
+## Task: Update store.go to schema v3 with Action+Params, v2→v3 migration
+
+## Background & Context
+
+The sticky-overseer architecture refactor introduces an action-based task model to replace the simple command/args model. Instead of storing a raw command string and argument array, tasks now reference an action by name and include a params map for action-specific configuration.
+
+This shift enables:
+- Flexible action drivers with custom parameter validation
+- Reusable action configurations
+- Better audit trails (action name vs raw command)
+- Support for pool management per action type
+
+The database schema must be updated from v2 to v3, and existing databases must be migrated while preserving task records.
+
+## Problem Description
+
+Current schema (v2) stores:
+- `command` (string) - the executable command
+- `args` (string, JSON) - arguments array
+
+New schema (v3) needs:
+- `action` (string) - the action handler name
+- `params` (string, JSON) - action-specific parameters
+
+The migration must:
+1. Convert old command column to action (preserving the value as action name)
+2. Set params to empty JSON object `{}`
+3. Drop the old args column
+4. Update schema_version to 3
+5. All CRUD operations must use new fields
+
+Existing tasks with action names that no longer exist in config will fail validation - this is expected and correct behavior.
+
+## Implementation Plan
+
+1. Update `TaskRecord` struct in store.go:
+   - Remove: `Command string`
+   - Remove: `Args []string`
+   - Add: `Action string`
+   - Add: `Params map[string]string`
+
+2. Update `schemaVersion` constant from 2 to 3
+
+3. Update all CRUD functions to use Action+Params:
+   - `createTask(db, record)` - INSERT with action, params (JSON-encode the map)
+   - `getTask(db, taskID)` - SELECT with action, params (JSON-decode to map)
+   - `updateTask(db, record)` - UPDATE with action, params
+   - `listTasks(db, since)` - SELECT with action, params
+
+4. Implement v2→v3 migration in `openDB` function:
+   - Add migration case for schema version 2 → 3
+   - Execute in a transaction:
+     a. CREATE TABLE tasks_v3 with new schema
+     b. INSERT from old tasks table (command → action, {} → params)
+     c. DROP old tasks table
+     d. RENAME tasks_v3 to tasks
+     e. UPDATE schema_version to 3
+   - Migration SQL provided in description below
+
+5. Handle JSON encoding/decoding:
+   - When creating task: `json.Marshal(record.Params)` → store as string
+   - When reading task: `json.Unmarshal(paramsJSON)` → restore to map[string]string
+   - Use `map[string]string` not `interface{}` for type safety
+
+## Technical Requirements
+
+- File location: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/store.go`
+- Migration SQL (execute in transaction):
+```sql
+CREATE TABLE tasks_v3 (
+    task_id TEXT PRIMARY KEY,
+    action  TEXT NOT NULL,
+    params  TEXT NOT NULL DEFAULT '{}',
+    retry_policy TEXT,
+    state TEXT NOT NULL DEFAULT 'active',
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    exit_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_started_at TEXT,
+    last_exited_at TEXT,
+    error_message TEXT,
+    exit_timestamps TEXT NOT NULL DEFAULT '[]'
+);
+INSERT INTO tasks_v3
+    SELECT task_id, command AS action, '{}' AS params,
+           retry_policy, state, restart_count, exit_count,
+           created_at, last_started_at, last_exited_at,
+           error_message, exit_timestamps
+    FROM tasks;
+DROP TABLE tasks;
+ALTER TABLE tasks_v3 RENAME TO tasks;
+UPDATE schema_version SET version = 3;
+```
+- Use `sql.Tx` for transaction safety
+- Test with actual SQLite to verify migration integrity
+
+## Success Criteria
+
+- `go build ./...` succeeds
+- All existing store tests pass: `go test -race ./...`
+- New test `TestMigrateV2ToV3`: 
+  - Create temp SQLite DB with v2 schema + sample task rows (command="echo", args=["hello"])
+  - Call `openDB` on the migrated database
+  - Verify: schema_version = 3
+  - Verify: migrated task has action = "echo" (old command value)
+  - Verify: migrated task has params = {} (empty map)
+  - Verify: no args column exists in final schema
+  - Verify: task_id, state, retry_policy preserved
+- New test `TestStoreV3_CRUD`:
+  - Create task with action="exec", params={"cmd": "echo", "args": "hello"}
+  - Get task and verify Action and Params fields
+  - Update task params
+  - List tasks and verify Action+Params in results
+- Test fresh v3 install (no migration needed) works correctly
+
+## Expected Outcome
+
+Database schema updated to v3 with action+params model. Existing v2 databases automatically migrated on first `openDB()` call. All CRUD operations use new fields. Schema is ready for action handler integration.
+
+## Reference Information
+
+- File: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/store.go`
+- Test helpers: existing test utilities in store_test.go
+- Related job 04: Actions system that provides action handlers
+- Related job 10: Hub refactor that creates tasks with actions
+- SQLite docs: https://www.sqlite.org/lang_createtable.html
+
+## Notes & Warnings
+
+- Schema migration is irreversible - back up existing databases before testing
+- Old command-only tasks will have action names, may fail if action undefined
+- Params as JSON string in DB - ensure proper escaping
+- Use map[string]string for Params (not map[string]interface{}) for consistency
+- Test migration with real SQLite, not just in-memory

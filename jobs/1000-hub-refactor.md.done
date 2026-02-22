@@ -1,0 +1,266 @@
+---
+title: Refactor hub.go to wire all new components and implement new protocol handlers
+created: 2026-02-21
+origin: sticky-overseer architecture refactor - central integration point
+priority: critical
+complexity: high
+notes:
+  - This is the most extensive change in the refactor
+  - Hub becomes central integration point for actions, pool, and transport
+  - Must handle both old and new task lifecycle (active/queued/errored/stopped)
+  - Remove pinnedCommand logic entirely
+  - New protocol handlers for pool management, action discovery, purge operations
+---
+
+Follow exactly and without stopping:
+
+## Task: Refactor hub.go to wire all new components and implement new protocol handlers
+
+## Background & Context
+
+The Hub is the central orchestrator in sticky-overseer. After the refactor, it must:
+1. Coordinate with ActionHandlers to create and manage tasks
+2. Use PoolManager to enforce concurrency limits and queue overflow policies
+3. Serve clients over abstract Transport connections (no longer WebSocket-specific)
+4. Implement expanded protocol including pool management, action discovery, and purge
+5. Remove the pinned command limitation
+
+This job integrates all previously completed work (worker filtering, schema v3, transport abstraction) into a cohesive system.
+
+## Problem Description
+
+Current Hub implementation:
+- Coupled to WebSocket connections
+- No action abstraction - direct command execution
+- No pool management - all tasks run immediately or fail
+- pinnedCommand limits deployment flexibility
+- clients map uses per-connection mutexes
+
+After refactor:
+- Hub works with any Conn type (TCP, STDIO, Unix)
+- Tasks created through ActionHandlers with validation
+- Pool enforces concurrency and queue policies
+- Full action flexibility
+- Write locks embedded in Conn implementations
+
+## Implementation Plan
+
+1. Update `hubConfig` struct:
+```go
+type hubConfig struct {
+    DB          *sql.DB
+    EventLog    io.Writer
+    Actions     map[string]ActionHandler  // built once at startup; immutable
+    Pool        *PoolManager
+    TrustedNets []*net.IPNet  // passed through for transport if needed
+}
+```
+
+2. Update `Hub` struct:
+```go
+type Hub struct {
+    mu      sync.RWMutex
+    db      *sql.DB
+    eventLog io.Writer
+    
+    clients map[Conn]struct{}  // all connected clients
+    tasks   map[string]*Task   // running tasks by task_id
+    
+    actions map[string]ActionHandler  // immutable after startup
+    pool    *PoolManager              // manages concurrency + queue
+}
+```
+- Remove `pinnedCommand string` field
+- Change clients type from `map[*websocket.Conn]*sync.Mutex` to `map[Conn]struct{}`
+
+3. Update protocol dispatch in `HandleClient` (accept `Conn` instead of `*websocket.Conn`):
+```go
+func (h *Hub) HandleClient(conn Conn) {
+    // ... add to clients map ...
+    // defer remove from clients map ...
+    
+    for {
+        var msg IncomingMessage
+        if err := conn.ReadJSON(&msg); err != nil {
+            // handle read error
+            return
+        }
+        
+        switch msg.Type {
+        case "start":       h.handleStart(conn, msg)
+        case "list":        h.handleList(conn, msg)
+        case "stop":        h.handleStop(conn, msg)
+        case "reset":       h.handleReset(conn, msg)
+        case "replay":      h.handleReplay(conn, msg)
+        case "describe":    h.handleDescribe(conn, msg)
+        case "pool_info":   h.handlePoolInfo(conn, msg)
+        case "purge":       h.handlePurge(conn, msg)
+        case "set_pool":    h.handleSetPool(conn, msg)
+        default:
+            h.sendError(conn, msg.ID, "unknown message type: "+msg.Type)
+        }
+    }
+}
+```
+
+4. Implement `handleDescribe(conn Conn, msg IncomingMessage)`:
+   - If `msg.Action` is non-empty:
+     - Look up single handler by name
+     - If not found: send error response
+     - Call `handler.Describe()` → get ActionInfo
+     - Set `ActionInfo.Name` to the map key
+     - Respond with `{Type:"actions", Actions:[ActionInfo], ID:msg.ID}`
+   - If `msg.Action` is empty:
+     - Iterate all handlers in h.actions
+     - Call `Describe()` on each
+     - Set `Name` field to map key for each
+     - Collect all into Actions slice
+     - Respond with all ActionInfos
+
+5. Implement `handleStart(conn Conn, msg IncomingMessage)`:
+   - Look up handler by `msg.Action` → send error if not found
+   - Call `handler.Validate(msg.Params)` → send validation error if fails
+   - Generate task_id if `msg.TaskID` is empty (use UUID)
+   - Create callback functions:
+     ```go
+     stopFn := func() { h.stopWorker(taskID, true) }
+     startFn := func() error {
+         // Call handler.Start(...) → get Worker
+         // Create TaskRecord with action, params, task_id
+         // Store in DB via createTask()
+         // Store in hub.tasks
+         // Broadcast "started" event to all clients
+         return nil
+     }
+     ```
+   - Call `h.pool.Acquire(taskID, msg.Action, msg.Force, stopFn, startFn)`
+   - If Acquire returns queued: broadcast "queued" event, send "queued" response to caller
+   - If Acquire returns running: task already started (from startFn), send appropriate response
+   - If Acquire returns error: send error response
+
+6. Implement `handleStop(conn Conn, msg IncomingMessage)`:
+   - Look up task in `h.tasks` (running task)
+   - If found: send SIGTERM, SIGKILL after 5s (existing worker stop logic)
+   - Also check if task is queued via `h.pool.Dequeue(msg.TaskID)`
+   - If queued: broadcast "dequeued" event to all clients
+   - If neither running nor queued: send error "task not found"
+
+7. Implement `handleReset(conn Conn, msg IncomingMessage)`:
+   - Look up task in `h.tasks`
+   - If not found: send error
+   - Get task.record.Action and look up handler
+   - If handler not found: send error
+   - Call `handler.Start(...)` directly (bypass pool - retry restarts are exempt)
+   - Store updated task in DB
+   - Broadcast "started" event
+
+8. Implement `handleReplay(conn Conn, msg IncomingMessage)`:
+   - Look up task in `h.tasks`
+   - Parse `msg.Since` timestamp (RFC3339, default to task start)
+   - Get events from worker.events ring buffer since that time
+   - Send events to THIS CONNECTION ONLY (not broadcast)
+   - Then send final "replay_done" message
+
+9. Implement `handleList(conn Conn, msg IncomingMessage)`:
+   - Get DB tasks with `listTasks(db, msg.Since)` 
+   - Get queued tasks from `h.pool.Info("")` (empty action = all)
+   - Merge both lists:
+     - For queued tasks: set State=StateQueued, QueuedAt timestamp
+     - For DB tasks: map State/RestartCount/ExitCount fields
+   - Sort by creation time
+   - Send single "tasks" response with merged list
+
+10. Implement `handlePoolInfo(conn Conn, msg IncomingMessage)`:
+    - Call `h.pool.Info(msg.Action)` 
+    - Respond with `{Type:"pool_info", Action:msg.Action, Running:..., Queued:..., ID:msg.ID}`
+
+11. Implement `handlePurge(conn Conn, msg IncomingMessage)`:
+    - If `msg.Action` empty: purge all queues
+    - Else: purge specific action queue
+    - `h.pool.PurgeQueue(msg.Action)` → returns count + list of purged task IDs
+    - For each purged task: broadcast "dequeued" event to all clients
+    - Respond with `{Type:"purged", Count:..., Action:msg.Action, ID:msg.ID}`
+
+12. Implement `handleSetPool(conn Conn, msg IncomingMessage)`:
+    - Call `h.pool.SetLimits(msg.Action, msg.Limit, msg.QueueSize, msg.Excess)`
+    - If error: send error response
+    - If success: respond with confirmation and broadcast to all clients
+
+13. Update `Broadcast` helper method:
+    - Change from `h.clients map[*websocket.Conn]*sync.Mutex`
+    - To `h.clients map[Conn]struct{}`
+    - Use `conn.WriteLock()` instead of per-connection mutex lookup
+    - Lock, write JSON, unlock for each client
+
+14. Update `doRestart` / `handleReset` helpers:
+    - Handler lookup by task.record.Action
+    - Call `handler.Start(...)` to spawn new worker
+    - Bypass pool acquisition (retries are exempt from pool limits)
+
+15. Update task worker callbacks:
+    - When worker starts: broadcast "started", create TaskRecord, store in DB
+    - When worker produces output: broadcast "output" to all
+    - When worker exits: store exit info, check retry policy, call doRestart if needed, broadcast "exited" or "restarting" or "errored"
+
+16. Remove all pinnedCommand references:
+    - Delete pinnedCommand field from Hub
+    - Remove pinnedCommand logic from handleStart
+    - Update tests to not use pinned command
+
+17. Update error handling and responses:
+    - Use consistent error response format
+    - Echo msg.ID in all responses
+    - Validate message fields and return appropriate errors
+
+## Technical Requirements
+
+- File location: `/home/mmulligan/Development/whisper-darkly-github/sticky-overseer/hub.go`
+- Core types available from other jobs: ActionHandler, ActionInfo, PoolManager, Conn, Transport
+- Message types: use existing types from messages.go (job 02), plus new types ActionsMessage, PoolMessage, PurgedMessage, etc.
+- Task states: active, stopped, errored, queued (new)
+- Must use h.db for task persistence
+- Must use h.eventLog if set to log all events
+- Hub startup in main.go will pass Actions map and Pool to hubConfig
+
+## Success Criteria
+
+- `go build ./...` succeeds
+- All existing tests pass (after updating test helpers in job 12)
+- New test `TestStart_UnknownAction`: send start with unknown action → error response with appropriate message
+- New test `TestStart_MissingRequiredParam`: send start to exec handler without required param → validation error response
+- New test `TestStart_CELValidationFail`: param fails CEL validation rule → validation error
+- New test `TestDescribe_AllActions`: describe with no action field → returns all actions in response
+- New test `TestDescribe_SingleAction`: describe with specific action → returns only that action
+- New test `TestPoolInfo_Global`: pool_info with empty action → returns aggregate counts
+- New test `TestPoolInfo_PerAction`: pool_info with specific action → returns counts for that action
+- New test `TestPurge_ByAction`: purge specific action queue, verify dequeued events broadcast
+- New test `TestPurge_All`: purge all queues, verify all items dequeued
+- New test `TestStop_DequeuedTask`: stop a queued (not running) task → dequeued event
+- New test `TestSetPool_ReducesLimit`: change pool limit, verify enforced on next start
+- New test `TestBroadcast_AllClients`: verify broadcast sends to all clients using Conn interface
+
+## Expected Outcome
+
+Hub.go fully integrated with action handlers, pool manager, and transport abstraction. New protocol handlers support action discovery, pool management, queue purging, and flexible task execution. Old pinnedCommand limitation removed.
+
+## Reference Information
+
+- Job 04: Actions system (ActionHandler, ActionInfo)
+- Job 06: PoolManager implementation
+- Job 09: Transport layer (Conn, Transport)
+- Job 02: Protocol messages (messages.go)
+- Job 08: Store schema v3 (TaskRecord with Action+Params)
+- Worker callbacks: existing worker.go has callback mechanism
+- Test helpers in job 12 show how to construct test configs
+
+## Notes & Warnings
+
+- Hub.mu guards clients and tasks maps - use RWLock appropriately
+- Task.mu guards per-task state (already in existing code)
+- Broadcast must use conn.WriteLock() not a Hub-level lock for each write
+- Never hold h.mu while calling handler methods (deadlock risk)
+- Pool.Acquire can spawn worker in callback - ensure no deadlock with h.mu
+- Handler.Start() is called inside pool callback - must not block indefinitely
+- Task lifecycle: pool.Acquire → startFn called → handler.Start() → Task created → worker running
+- For retries: doRestart calls handler.Start() directly, bypassing pool
+- Describe endpoint reveals all action names - this is intentional for client discovery

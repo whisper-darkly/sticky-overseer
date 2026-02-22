@@ -1,0 +1,153 @@
+---
+title: Add config.go with YAML config types and loadConfig() function
+created: 2026-02-21
+origin: sticky-overseer major architecture refactor — implementing YAML-based configuration system
+priority: high
+complexity: medium
+notes:
+  - Config is loaded once at startup; no hot-reload, no fsnotify watcher
+  - Default values for Listen and DB must be set in loadConfig (not struct tags)
+  - ParamSpec YAML polymorphism is complex but critical for flexibility
+  - PoolConfig and related types should be defined in pool.go, not config.go
+  - ENV overrides are applied in main.go AFTER loadConfig returns, not inside loadConfig
+---
+
+Follow exactly and without stopping:
+
+## Task: Add config.go with YAML config types and loadConfig() function
+
+## Background & Context
+The refactor introduces YAML-based configuration, replacing hardcoded command-line flags. Actions are defined in a config file with metadata, type, retry policies, task pools, and CEL-validated parameters. The config system:
+- Loads once at startup (no hot-reload)
+- Supports type-safe action definitions
+- Uses CEL expressions for parameter validation
+- Inherits and merges retry/pool settings hierarchically (global → action-specific)
+- Substitutes parameter values into action commands via template rendering
+
+config.go implements the type definitions and loadConfig() function that reads a YAML file and returns a Config struct. Environment variable overrides are applied by main.go after loadConfig returns.
+
+## Problem Description
+Currently, startup configuration is hardcoded via command-line flags. There is no action registry, no parameter validation, no per-action retry/pool configuration. Implementing named actions requires a configuration system that:
+- Loads from YAML
+- Defines per-action metadata, types, retry policies, and task pools
+- Supports flexible parameter specs (required, optional with defaults, CEL-validated)
+- Provides defaults so minimal config works
+- Can be overridden by environment variables (in main.go)
+
+## Implementation Plan
+1. Create /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go
+2. Define Config struct with yaml tags:
+   ```go
+   type Config struct {
+       Listen       string                        `yaml:"listen"`
+       DB           string                        `yaml:"db"`
+       LogFile      string                        `yaml:"log_file"`
+       TrustedCIDRs []string                      `yaml:"trusted_cidrs"`
+       Retry        RetryPolicy                   `yaml:"retry"`
+       TaskPool     PoolConfig                    `yaml:"task_pool"`
+       Actions      map[string]ActionConfig       `yaml:"actions"`
+   }
+   ```
+3. Define ActionConfig struct:
+   ```go
+   type ActionConfig struct {
+       Meta     ActionMeta              `yaml:"meta"`
+       Type     string                  `yaml:"type"`
+       Retry    RetryPolicy             `yaml:"retry"`
+       TaskPool PoolConfig              `yaml:"task_pool"`
+       Config   map[string]any          `yaml:"config"`
+   }
+   ```
+4. Define ActionMeta struct:
+   ```go
+   type ActionMeta struct {
+       Description string `yaml:"description"`
+   }
+   ```
+5. Define ParamSpec struct (no YAML tags on struct itself, uses UnmarshalYAML):
+   ```go
+   type ParamSpec struct {
+       Default  *string
+       Validate string
+   }
+   ```
+6. Implement ParamSpec.UnmarshalYAML to handle three forms:
+   - `null` → ParamSpec{Default: nil, Validate: ""}
+   - Plain string (e.g., "chaturbate") → ParamSpec{Default: &s, Validate: ""}
+   - Map with `default` and/or `validate` keys → full struct
+7. Define DisplacePolicy constants:
+   ```go
+   type DisplacePolicy string
+   const (
+       DisplaceFalse    DisplacePolicy = "false"
+       DisplaceTrue     DisplacePolicy = "true"
+       DisplaceProhibit DisplacePolicy = "prohibit"
+   )
+   ```
+8. Note: PoolConfig, QueueConfig, ExcessConfig are defined in pool.go (later job)
+   - Import them once pool.go exists or forward-declare as needed
+9. Implement loadConfig(path string) (*Config, error):
+   - If path is empty string: return default Config with Listen=":8080", DB="./overseer.db"
+   - If path is non-empty: read YAML from file, unmarshal into Config
+   - Return error if file read fails or YAML unmarshal fails
+10. Write unit tests:
+    - TestLoadConfig_Defaults: empty path returns Listen=":8080", DB="./overseer.db"
+    - TestLoadConfig_YAML: parse sample YAML config with actions, retry, task_pool
+    - TestParamSpec_YAML_Null: null unmarshals to required param
+    - TestParamSpec_YAML_String: plain string unmarshals to optional with default
+    - TestParamSpec_YAML_Map: map unmarshals to full struct with default and validate
+    - TestRetryPolicy_YAML: duration strings "5s", "1m30s" parse correctly
+11. Build and test: `go build ./...` then `go test -race ./...`
+
+## Technical Requirements
+- File path: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/config.go (NEW)
+- Dependencies: gopkg.in/yaml.v3 (must be added in job 0100)
+- YAML field names: listen, db, log_file, trusted_cidrs, retry, task_pool, actions
+- DisplacePolicy enum: "false", "true", "prohibit" (strings, not booleans)
+- ParamSpec YAML unmarshalling must handle all three forms flexibly
+
+## Success Criteria
+- `go build ./...` succeeds
+- TestLoadConfig_Defaults passes: empty path produces Listen=":8080", DB="./overseer.db"
+- TestLoadConfig_YAML passes: valid YAML config is parsed correctly
+- TestParamSpec_YAML_Null passes: null value → required param
+- TestParamSpec_YAML_String passes: string value → optional with default
+- TestParamSpec_YAML_Map passes: map value → full struct
+- TestRetryPolicy_YAML passes: duration strings parse correctly
+- `go test -race ./...` passes all tests
+
+## Expected Outcome
+config.go is complete and tested. YAML configuration can be loaded at startup. Default values are applied when config file is missing. ParamSpec supports all three YAML forms. Ready for integration with loadActionHandlers() in actions.go and main.go startup sequence.
+
+## Reference Information
+- Project root: /home/mmulligan/Development/whisper-darkly-github/sticky-overseer/
+- YAML example structure (will be in CLAUDE.md or design docs):
+  ```yaml
+  listen: ":9000"
+  db: "./overseer.db"
+  retry:
+    restart_delay: 5s
+    error_window: 1m
+    error_threshold: 3
+  task_pool:
+    limit: 10
+  actions:
+    stream:
+      meta:
+        description: "Start streaming task"
+      type: exec
+      retry:
+        restart_delay: 10s
+      config:
+        entrypoint: /opt/bin/stream
+        command: ["--source", "{.source}"]
+  ```
+- yaml.v3 docs: https://pkg.go.dev/gopkg.in/yaml.v3
+- Time duration format: https://pkg.go.dev/time#ParseDuration
+
+## Notes & Warnings
+- PoolConfig will be defined in pool.go; config.go imports it (Job 0600)
+- ENV overrides are NOT applied in loadConfig; that happens in main.go
+- Default values must be set in loadConfig function, not struct tags
+- ParamSpec.UnmarshalYAML is tricky but essential for YAML flexibility
+- Keep DisplacePolicy as string enum, not bool (important for "prohibit" state)

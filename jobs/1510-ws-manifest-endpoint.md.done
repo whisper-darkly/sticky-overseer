@@ -1,0 +1,524 @@
+---
+title: Implement GET /ws/manifest and WS manifest message in sticky-overseer
+created: 2026-02-21
+origin: sticky-bb needs a machine-readable protocol descriptor endpoint to auto-build WebSocket command forms
+priority: high
+complexity: medium
+depends_on: 1500-ws-manifest-schema.md (the schema spec must exist in sticky-bb before this runs)
+notes:
+  - The WS Manifest format is specified in ../sticky-bb/docs/ws-manifest-spec.md
+  - The example manifest ../sticky-bb/docs/ws-manifest-overseer-example.json is the reference for output shape
+  - HTTP: GET /ws/manifest — returns the manifest as JSON (no WS connection required)
+  - WS: type="manifest" message — returns the same document over the WS connection
+  - The manifest is semi-dynamic: protocol structure is static, `actions` array is runtime
+  - Add a Docker Compose example showing sticky-bb + sticky-overseer side by side
+  - All tests must pass; add tests for the new endpoint and message handler
+  - Commit everything to sticky-overseer git
+---
+
+Follow exactly and without stopping:
+
+## Task: Implement the WS Manifest endpoint in sticky-overseer
+
+This job has four parts:
+1. Add `manifest.go` — WSManifest types + `BuildManifest` function
+2. Update `transport.go` — add `GET /ws/manifest` HTTP route
+3. Update `hub.go` — add `"manifest"` WS message type
+4. Add Docker Compose example — sticky-bb + sticky-overseer
+5. Add tests
+6. Commit
+
+---
+
+## Step 1: Create `manifest.go`
+
+This file owns the static protocol description and the runtime builder. It must
+never import anything outside the standard library and the project itself.
+
+### WSManifest and related types
+
+Define Go structs that match the WS Manifest schema from
+`../sticky-bb/docs/ws-manifest.schema.json`.
+
+```go
+package overseer
+
+// WSManifest is the top-level document returned by GET /ws/manifest and by
+// the "manifest" WebSocket message. It fully describes the protocol so that
+// generic tools (e.g. sticky-bb) can auto-build send forms and response panels.
+type WSManifest struct {
+    Schema      string                     `json:"$schema,omitempty"`
+    Protocol    string                     `json:"protocol"`
+    Version     string                     `json:"version"`
+    Description string                     `json:"description"`
+    Transport   ManifestTransport          `json:"transport"`
+    Types       map[string]ManifestType    `json:"types"`
+    Messages    map[string]ManifestMessage `json:"messages"`
+    Operations  map[string]ManifestOp      `json:"operations"`
+    Actions     []ActionInfo               `json:"actions"`
+}
+
+// ManifestTransport describes the WebSocket connection conventions.
+type ManifestTransport struct {
+    Path             string `json:"path"`
+    TypeField        string `json:"type_field"`
+    CorrelationField string `json:"correlation_field,omitempty"`
+}
+
+// ManifestType is a reusable named type definition.
+type ManifestType struct {
+    Type        string                    `json:"type,omitempty"`
+    Description string                    `json:"description,omitempty"`
+    Values      []string                  `json:"values,omitempty"`
+    Fields      map[string]ManifestField  `json:"fields,omitempty"`
+    Items       any                       `json:"items,omitempty"`
+    ValueType   any                       `json:"value_type,omitempty"`
+}
+
+// ManifestField is a field within a ManifestType or ManifestMessage.
+type ManifestField struct {
+    Type        string                   `json:"type,omitempty"`
+    Ref         string                   `json:"$ref,omitempty"`
+    Description string                   `json:"description,omitempty"`
+    Required    bool                     `json:"required,omitempty"`
+    Default     any                      `json:"default,omitempty"`
+    UIHint      string                   `json:"ui_hint,omitempty"`
+    Values      []string                 `json:"values,omitempty"`
+    Fields      map[string]ManifestField `json:"fields,omitempty"`
+    Items       any                      `json:"items,omitempty"`
+    ValueType   any                      `json:"value_type,omitempty"`
+}
+
+// ManifestMessage describes a single message type in the protocol.
+type ManifestMessage struct {
+    Description string                   `json:"description"`
+    Direction   string                   `json:"direction"`          // "c2s" or "s2c"
+    Delivery    string                   `json:"delivery,omitempty"` // "direct", "broadcast", "broadcast_subscribers"
+    Fields      map[string]ManifestField `json:"fields"`
+}
+
+// ManifestOp describes a logical request/response operation.
+type ManifestOp struct {
+    Description string              `json:"description"`
+    Send        string              `json:"send"`
+    Responses   ManifestOpResponses `json:"responses"`
+    Notes       string              `json:"notes,omitempty"`
+}
+
+// ManifestOpResponses holds the direct and side-effect response descriptions.
+type ManifestOpResponses struct {
+    Direct      *ManifestOpDirect      `json:"direct,omitempty"`
+    SideEffects *ManifestOpSideEffects `json:"side_effects,omitempty"`
+}
+
+// ManifestOpDirect holds success and error message types for direct responses.
+type ManifestOpDirect struct {
+    Success []string `json:"success,omitempty"`
+    Error   []string `json:"error,omitempty"`
+}
+
+// ManifestOpSideEffects holds broadcast message types triggered as side effects.
+type ManifestOpSideEffects struct {
+    Broadcast             []string `json:"broadcast,omitempty"`
+    BroadcastSubscribers  []string `json:"broadcast_subscribers,omitempty"`
+}
+```
+
+### ref helper
+
+Add a small helper that builds a `ManifestField` whose only content is a `$ref`:
+
+```go
+func refField(typeName string) ManifestField {
+    return ManifestField{Ref: "#/types/" + typeName}
+}
+```
+
+### BuildManifest
+
+`BuildManifest` constructs the full manifest. The static protocol definition is
+hardcoded here (it does not change between runs). The `actions` field is
+populated from the live action registry.
+
+The function signature:
+
+```go
+// BuildManifest constructs a WSManifest for the current server instance.
+// actions is the runtime handler map (may be nil — produces empty actions list).
+// version is the server's version string (e.g. from a VERSION file or constant).
+func BuildManifest(actions map[string]ActionHandler, version string) WSManifest
+```
+
+Implement `BuildManifest` by building out each section in full:
+
+#### types section
+
+Build the complete `types` map with all named types from the spec. Use the
+`ManifestType` struct. Include every type listed in job 1500's Step 3 "types"
+section. Key entries (show full fields for each):
+
+```
+TaskState    — enum: active, stopped, errored, queued
+WorkerState  — enum: running, exited
+Stream       — enum: stdout, stderr
+QueueOrder   — enum: first, last
+ExcessAction — enum: stop, requeue
+KillOrder    — enum: first, last
+RetryPolicy  — object with restart_delay (duration), error_window (duration), error_threshold (integer)
+QueueConfig  — object with enabled (bool), size (int), order ($ref QueueOrder), max_age (int), displace (object)
+ExcessConfig — object with action ($ref ExcessAction), order ($ref KillOrder), grace (int)
+PoolConfig   — object with limit (int), queue ($ref QueueConfig), excess ($ref ExcessConfig)
+PoolInfo     — object with limit (int), running (int), queue_depth (int), queue_items (array)
+ParamSpec    — object with default (string, nullable), validate (string)
+ActionInfo   — object with name, type, description, params, task_pool, retry, dedupe_key
+TaskInfo     — object with all fields from the TaskInfo struct in messages.go
+TaskMetrics  — object with output_lines, restart_count, runtime_ms, last_exit_code
+ActionMetrics — object
+GlobalMetrics — object
+```
+
+#### messages section
+
+Build the complete `messages` map. Every message must have:
+- A `type` field in its `Fields` map with `UIHint: "hidden"` and `Required: true`
+- An `id` field for all c2s messages: `{ Type: "string", Description: "Client correlation ID; echoed in direct response" }`
+- All actual payload fields with correct types, required flags, and descriptions
+
+Follow the table in job 1500's Step 3 "messages" sections exactly.
+
+For s2c messages that also carry `id` (direct responses), add `id` as an optional
+string field with description "Echoes the client's correlation ID".
+
+#### operations section
+
+Build the complete `operations` map. Follow job 1500's Step 3 "operations" section
+exactly. Include all `notes` strings.
+
+#### actions
+
+Collect `ActionInfo` from the actions map using `handler.Describe()`, set each
+`info.Name` from the map key, and return them sorted by name. If `actions` is nil,
+return `[]ActionInfo{}`.
+
+### ManifestMessage for the WS manifest message itself
+
+Add `"manifest"` to the s2c messages map with `Delivery: "direct"` and a
+description of "Full WS Manifest document returned in response to a manifest request".
+Its `Fields` map should describe the top-level manifest document fields (just
+the key ones: protocol, version, description, transport, and notes pointing to the
+full schema).
+
+### ManifestMessage type for the wire message
+
+Add to `messages.go`:
+
+```go
+// ManifestMessage is the WS response to a "manifest" client request.
+// The Manifest field contains the full WSManifest document.
+type ManifestWireMessage struct {
+    Type     string     `json:"type"`
+    ID       string     `json:"id,omitempty"`
+    Manifest WSManifest `json:"manifest"`
+}
+```
+
+(Use `ManifestWireMessage` to avoid collision with the `ManifestMessage` type
+defined in manifest.go.)
+
+---
+
+## Step 2: Update `transport.go`
+
+Add a `GET /ws/manifest` route to `tcpTransport.Listen`. The route:
+
+1. Calls `BuildManifest(nil, version)` where version is read from a package-level
+   constant or the `VERSION` file at startup
+2. Marshals the result as JSON
+3. Sets `Content-Type: application/json` and writes the response
+
+The hub is not available inside tcpTransport. To make it available, add a
+`hub *Hub` field to `tcpTransport`:
+
+```go
+type tcpTransport struct {
+    addr        string
+    trustedNets []*net.IPNet
+    hub         *Hub    // set by main.go after hub creation; used for /ws/manifest
+    version     string  // set by main.go
+}
+```
+
+Update `main.go` to wire in the hub and version after creating both:
+
+```go
+t = t.withHub(hub).withVersion(version)
+```
+
+Add `withHub` and `withVersion` convenience methods on `tcpTransport`.
+
+In the route handler, if `t.hub` is non-nil, use `t.hub.actions` for the live
+action list. Otherwise use nil (empty actions list).
+
+Add a `version` constant or read the `VERSION` file at startup in main.go and
+pass it through.
+
+---
+
+## Step 3: Update `hub.go`
+
+Add `"manifest"` to the message type switch in the hub's connection read loop:
+
+```go
+case "manifest":
+    h.handleManifest(conn, msg)
+```
+
+Implement `handleManifest`:
+
+```go
+func (h *Hub) handleManifest(conn Conn, msg IncomingMessage) {
+    h.mu.RLock()
+    actions := h.actions
+    h.mu.RUnlock()
+    manifest := BuildManifest(actions, h.version)
+    h.sendJSON(conn, ManifestWireMessage{
+        Type:     "manifest",
+        ID:       msg.ID,
+        Manifest: manifest,
+    })
+}
+```
+
+Add a `version string` field to `Hub` and `HubConfig`. Wire it in `NewHub` and
+in `main.go` when creating `HubConfig`.
+
+---
+
+## Step 4: Read VERSION at startup
+
+In `main.go`, read the `VERSION` file at startup:
+
+```go
+versionBytes, err := os.ReadFile("VERSION")
+if err != nil {
+    versionBytes = []byte("unknown")
+}
+version := strings.TrimSpace(string(versionBytes))
+```
+
+Pass `version` to `HubConfig{Version: version}` and to the transport.
+
+---
+
+## Step 5: Add Docker Compose example
+
+File: `docker/compose-bb.yaml`
+
+This Compose file shows how to run sticky-overseer alongside sticky-bb so that
+sticky-bb can serve a WebSocket-aware UI for the overseer.
+
+```yaml
+# docker/compose-bb.yaml
+# Example: sticky-overseer + sticky-bb side by side
+#
+# sticky-bb serves the UI at http://localhost:9090
+# sticky-overseer listens at http://localhost:8080
+#
+# sticky-bb's config (mounted at /config/config.yaml) points at overseer:
+#
+#   listen_addr: ":9090"
+#   backends:
+#     - name: overseer
+#       openapi_url: http://overseer:8080/openapi.json
+#       websocket:
+#         url: ws://overseer:8080/ws
+#         label: "Overseer"
+#         send: true
+#
+# Start with:
+#   docker compose -f docker/compose-bb.yaml up
+#
+# Then open http://localhost:9090 in your browser.
+# The UI will load the OpenAPI spec and provide a WebSocket console.
+# Use the manifest endpoint to inspect the full protocol:
+#   curl http://localhost:8080/ws/manifest | jq .
+
+services:
+  overseer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./example-config.yaml:/config/config.yaml:ro
+    environment:
+      - OVERSEER_LISTEN=:8080
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/openapi.json"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  bb:
+    image: ghcr.io/whisper-darkly/sticky-bb:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./bb-config.yaml:/config/config.yaml:ro
+    depends_on:
+      overseer:
+        condition: service_healthy
+```
+
+Also create the example config files referenced by the Compose file:
+
+File: `docker/example-config.yaml` — overseer config with one exec action:
+
+```yaml
+listen_addr: ":8080"
+
+actions:
+  echo:
+    type: exec
+    description: "Echo a message to stdout"
+    config:
+      command: ["echo", "{{ .params.message }}"]
+    params:
+      message: null   # required
+```
+
+File: `docker/bb-config.yaml` — sticky-bb config pointing at overseer:
+
+```yaml
+listen_addr: ":9090"
+backends:
+  - name: overseer
+    openapi_url: http://overseer:8080/openapi.json
+    websocket:
+      url: ws://overseer:8080/ws
+      label: "Overseer"
+      send: true
+```
+
+---
+
+## Step 6: Update README
+
+In `README.md`, add a new section after the existing transport/config sections:
+
+```markdown
+## Protocol Manifest
+
+GET /ws/manifest returns a machine-readable description of the entire WebSocket
+protocol — every message type, field, delivery mode, and operation — as a JSON
+document conforming to the WS Manifest schema.
+
+This enables generic UI tools (such as [sticky-bb](../sticky-bb)) to automatically
+build typed send forms and response panels without any hardcoded knowledge of the
+overseer protocol.
+
+You can also request the manifest over the WebSocket connection itself:
+
+\```json
+{"type": "manifest", "id": "req-1"}
+\```
+
+The response is a `manifest` message containing the full document.
+
+### curl example
+
+\```bash
+curl -s http://localhost:8080/ws/manifest | jq '.operations | keys'
+\```
+
+### sticky-bb integration
+
+See `docker/compose-bb.yaml` for a complete Docker Compose example pairing
+sticky-overseer with sticky-bb.
+```
+
+---
+
+## Step 7: Add tests
+
+File: `manifest_test.go`
+
+Test the following:
+
+1. **TestBuildManifest_structure** — `BuildManifest(nil, "test")` returns a
+   manifest where:
+   - `Protocol == "sticky-overseer"`
+   - `Transport.Path == "/ws"`
+   - `Transport.TypeField == "type"`
+   - `Transport.CorrelationField == "id"`
+   - `len(Messages) >= 12` (at least the 12 c2s messages)
+   - `len(Operations) >= 12`
+   - `len(Types) >= 10`
+   - `Actions` is non-nil and empty (len==0)
+   - Every operation's `Send` key exists in `Messages`
+   - Every `$ref` string that appears in field definitions points to an existing type key
+
+2. **TestBuildManifest_actions** — given a mock action map with one action
+   that returns a known `ActionInfo`, `BuildManifest` includes that action in
+   `manifest.Actions` with the correct name.
+
+3. **TestManifestHTTPEndpoint** — create a `tcpTransport` with a test hub,
+   start it on `:0`, make a `GET /ws/manifest` request, verify:
+   - Status 200
+   - Content-Type is `application/json`
+   - Response unmarshals successfully into `WSManifest`
+   - `manifest.Protocol == "sticky-overseer"`
+
+4. **TestManifestWSMessage** — using the existing hub test helpers, connect a
+   client, send `{"type":"manifest","id":"m1"}`, receive the response, verify:
+   - Response `type == "manifest"`
+   - Response `id == "m1"`
+   - `manifest.protocol == "sticky-overseer"`
+
+File: `transport_manifest_test.go` (or add to `transport_test.go` if it exists):
+
+Ensure the HTTP test in TestManifestHTTPEndpoint properly starts and stops the
+transport with a context.
+
+---
+
+## Step 8: Run tests and fix any failures
+
+```bash
+go test ./... -count=1 -race
+```
+
+Fix any failures before committing.
+
+---
+
+## Step 9: Commit
+
+```bash
+git add manifest.go manifest_test.go transport.go hub.go messages.go main.go docker/compose-bb.yaml docker/example-config.yaml docker/bb-config.yaml README.md
+git commit -m "feat: add GET /ws/manifest and WS manifest message
+
+Adds a machine-readable protocol descriptor endpoint that describes
+every WebSocket message type, field, delivery mode, and logical
+operation. Enables generic UI tools to auto-build typed send forms
+and response panels without hardcoded protocol knowledge.
+
+- manifest.go: WSManifest types + BuildManifest with full static protocol definition
+- GET /ws/manifest HTTP endpoint (transport.go)
+- WS type='manifest' message handler (hub.go)
+- docker/compose-bb.yaml: example pairing with sticky-bb
+- README: documents the new endpoint and curl/bb integration examples"
+```
+
+---
+
+## Verification
+
+1. `go test ./... -count=1 -race` — all green
+2. `go build ./...` — clean build
+3. Start the server: `go run . -config testdata/config.yaml` (or any valid config)
+4. `curl -s http://localhost:8080/ws/manifest | jq '.protocol'` → `"sticky-overseer"`
+5. `curl -s http://localhost:8080/ws/manifest | jq '.operations | keys | length'` → at least 12
+6. `curl -s http://localhost:8080/ws/manifest | jq '.actions'` → `[]` (empty when no actions configured)
+7. Confirm `docker/compose-bb.yaml` parses: `docker compose -f docker/compose-bb.yaml config`
