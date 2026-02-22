@@ -139,7 +139,13 @@ func RunCLI(version, commit string) {
 		Actions:     actions,
 		Pool:        pool,
 		TrustedNets: trustedNets,
+		Version:     version,
 	})
+
+	// Attach hub and version to TCP transport for /ws/manifest endpoint.
+	if tcp, ok := transport.(tcpTransport); ok {
+		transport = tcp.withHub(hub).withVersion(version)
+	}
 
 	// 10. Setup graceful shutdown context.
 	ctx, cancel := context.WithCancel(context.Background())

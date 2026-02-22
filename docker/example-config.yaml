@@ -1,0 +1,10 @@
+listen_addr: ":8080"
+
+actions:
+  echo:
+    type: exec
+    description: "Echo a message to stdout"
+    config:
+      command: ["sh", "-c", "echo $MESSAGE"]
+    params:
+      message: null

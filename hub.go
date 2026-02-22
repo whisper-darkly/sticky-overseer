@@ -23,6 +23,7 @@ type HubConfig struct {
 	Actions     map[string]ActionHandler // built once at startup; immutable
 	Pool        *PoolManager             // manages concurrency + queue
 	TrustedNets []*net.IPNet             // passed through for transport if needed
+	Version     string                   // server version string (e.g. "2.1.0")
 }
 
 // TaskRecord holds the in-memory state for a task.
@@ -65,6 +66,7 @@ type Hub struct {
 	eventLogMu    sync.Mutex // serialises concurrent Encode calls on eventLog
 	shutdownCh    chan struct{}
 	shutdownOnce  sync.Once
+	version       string // server version string
 }
 
 // NewHub creates a Hub with an empty in-memory task map.
@@ -82,6 +84,7 @@ func NewHub(cfg HubConfig) *Hub {
 		db:            cfg.DB,
 		metrics:       NewMetrics(),
 		shutdownCh:    make(chan struct{}),
+		version:       cfg.Version,
 	}
 	if cfg.EventLog != nil {
 		h.eventLog = json.NewEncoder(cfg.EventLog)
@@ -481,6 +484,8 @@ func (h *Hub) HandleClient(conn Conn) {
 			h.handleUnsubscribe(conn, msg)
 		case "metrics":
 			h.handleMetrics(conn, msg)
+		case "manifest":
+			h.handleManifest(conn, msg)
 		default:
 			h.sendError(conn, msg.ID, "unknown message type: "+msg.Type)
 		}
@@ -1270,6 +1275,19 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+// handleManifest responds with the full WS Manifest document.
+func (h *Hub) handleManifest(conn Conn, msg IncomingMessage) {
+	h.mu.RLock()
+	actions := h.actions
+	h.mu.RUnlock()
+	manifest := BuildManifest(actions, h.version)
+	h.sendJSON(conn, ManifestWireMessage{
+		Type:     "manifest",
+		ID:       msg.ID,
+		Manifest: manifest,
+	})
 }
 
 // sendJSON writes a single JSON message to one specific connection.

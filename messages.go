@@ -326,6 +326,13 @@ type UnsubscribedMessage struct {
 	TaskID string `json:"task_id"`
 }
 
+// ManifestWireMessage is the WS response to a "manifest" client request.
+type ManifestWireMessage struct {
+	Type     string     `json:"type"`
+	ID       string     `json:"id,omitempty"`
+	Manifest WSManifest `json:"manifest"`
+}
+
 // Event stored in ring buffer
 
 type Event struct {

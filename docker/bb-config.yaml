@@ -1,0 +1,8 @@
+listen_addr: ":9090"
+backends:
+  - name: overseer
+    openapi_url: http://overseer:8080/openapi.json
+    websocket:
+      url: ws://overseer:8080/ws
+      label: "Overseer"
+      send: true

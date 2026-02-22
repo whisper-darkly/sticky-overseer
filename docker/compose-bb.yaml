@@ -1,0 +1,38 @@
+# docker/compose-bb.yaml
+# Example: sticky-overseer + sticky-bb side by side
+#
+# sticky-bb serves the UI at http://localhost:9090
+# sticky-overseer listens at http://localhost:8080
+#
+# Inspect the protocol manifest:
+#   curl http://localhost:8080/ws/manifest | jq .
+#
+# Start with:
+#   docker compose -f docker/compose-bb.yaml up
+#
+# Then open http://localhost:9090 in your browser.
+
+services:
+  overseer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./example-config.yaml:/config/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/openapi.json"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  bb:
+    image: ghcr.io/whisper-darkly/sticky-bb:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./bb-config.yaml:/config/config.yaml:ro
+    depends_on:
+      overseer:
+        condition: service_healthy

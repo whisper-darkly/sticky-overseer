@@ -112,12 +112,24 @@ func (c *wsConn) WriteLock() *sync.Mutex {
 type tcpTransport struct {
 	addr        string
 	trustedNets []*net.IPNet
+	hub         *Hub
+	version     string
 }
 
 // TrustedNets is a convenience setter used by tests and main.go wiring.
 // It is not part of the Transport interface.
 func (t tcpTransport) withTrustedNets(nets []*net.IPNet) tcpTransport {
 	t.trustedNets = nets
+	return t
+}
+
+func (t tcpTransport) withHub(h *Hub) tcpTransport {
+	t.hub = h
+	return t
+}
+
+func (t tcpTransport) withVersion(v string) tcpTransport {
+	t.version = v
 	return t
 }
 
@@ -144,6 +156,21 @@ func (t tcpTransport) Listen(ctx context.Context) (<-chan Conn, error) {
 	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(openAPISpec)
+	})
+
+	// Serve WS Manifest.
+	mux.HandleFunc("/ws/manifest", func(w http.ResponseWriter, r *http.Request) {
+		var actions map[string]ActionHandler
+		if t.hub != nil {
+			t.hub.mu.RLock()
+			actions = t.hub.actions
+			t.hub.mu.RUnlock()
+		}
+		manifest := BuildManifest(actions, t.version)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(manifest); err != nil {
+			log.Printf("tcp transport: manifest encode error: %v", err)
+		}
 	})
 
 	// WebSocket endpoint.

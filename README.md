@@ -188,6 +188,41 @@ func (h *myHandler) RunService(ctx context.Context, submit overseer.TaskSubmitte
 }
 ```
 
+## Protocol Manifest
+
+`GET /ws/manifest` returns a machine-readable JSON document that describes the
+entire WebSocket protocol — every message type, field, delivery mode, and
+logical operation — conforming to the
+[WS Manifest schema](https://github.com/whisper-darkly/sticky-bb/blob/main/docs/ws-manifest-spec.md).
+
+This enables generic UI tools (such as [sticky-bb](https://github.com/whisper-darkly/sticky-bb))
+to automatically build typed send forms and response panels without any hardcoded
+knowledge of the overseer protocol.
+
+The same document is also available over the WebSocket connection:
+
+```json
+{"type": "manifest", "id": "req-1"}
+```
+
+### curl example
+
+```bash
+# List all operation names
+curl -s http://localhost:8080/ws/manifest | jq '.operations | keys'
+
+# See fields for the start message
+curl -s http://localhost:8080/ws/manifest | jq '.messages.start.fields'
+
+# List configured actions
+curl -s http://localhost:8080/ws/manifest | jq '.actions[].name'
+```
+
+### sticky-bb integration
+
+See `docker/compose-bb.yaml` for a complete Docker Compose example pairing
+sticky-overseer with sticky-bb for a full browser-based testing UI.
+
 ## Docker
 
 ```bash
