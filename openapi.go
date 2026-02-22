@@ -8,13 +8,14 @@ import (
 
 // swaggerSpec is the root Swagger 2.0 document.
 type swaggerSpec struct {
-	Swagger  string                      `json:"swagger"`
-	Info     swaggerInfo                 `json:"info"`
-	BasePath string                      `json:"basePath,omitempty"`
-	Consumes []string                    `json:"consumes,omitempty"`
-	Produces []string                    `json:"produces,omitempty"`
-	Tags     []swaggerTag                `json:"tags,omitempty"`
-	Paths    map[string]swaggerPathItem  `json:"paths"`
+	Swagger             string                        `json:"swagger"`
+	Info                swaggerInfo                   `json:"info"`
+	BasePath            string                        `json:"basePath,omitempty"`
+	Consumes            []string                      `json:"consumes,omitempty"`
+	Produces            []string                      `json:"produces,omitempty"`
+	Tags                []swaggerTag                  `json:"tags,omitempty"`
+	Paths               map[string]swaggerPathItem    `json:"paths"`
+	XWebsocketEndpoints map[string]swaggerWSEndpoint  `json:"x-websocket-endpoints,omitempty"`
 }
 
 type swaggerInfo struct {
@@ -28,24 +29,38 @@ type swaggerTag struct {
 	Description string `json:"description,omitempty"`
 }
 
+// swaggerWSEndpoint describes a WebSocket connection endpoint for x-websocket-endpoints.
+type swaggerWSEndpoint struct {
+	Label            string `json:"label,omitempty"`
+	TypeField        string `json:"type_field"`
+	CorrelationField string `json:"correlation_field,omitempty"`
+}
+
 type swaggerPathItem struct {
 	Post *swaggerOperation `json:"post,omitempty"`
+	WS   *swaggerOperation `json:"ws,omitempty"`
 }
 
 type swaggerOperation struct {
-	Summary     string                      `json:"summary,omitempty"`
-	Description string                      `json:"description,omitempty"`
-	OperationID string                      `json:"operationId,omitempty"`
-	Tags        []string                    `json:"tags,omitempty"`
-	Consumes    []string                    `json:"consumes,omitempty"`
-	Parameters  []swaggerParameter          `json:"parameters,omitempty"`
-	Responses   map[string]swaggerResponse  `json:"responses"`
+	Summary     string                     `json:"summary,omitempty"`
+	Description string                     `json:"description,omitempty"`
+	OperationID string                     `json:"operationId,omitempty"`
+	Tags        []string                   `json:"tags,omitempty"`
+	Consumes    []string                   `json:"consumes,omitempty"`
+	Parameters  []swaggerParameter         `json:"parameters,omitempty"`
+	Responses   map[string]swaggerResponse `json:"responses"`
 
 	// Custom extensions with action metadata.
-	XActionType string      `json:"x-action-type,omitempty"`
-	XTaskPool   *PoolConfig `json:"x-task-pool,omitempty"`
+	XActionType string       `json:"x-action-type,omitempty"`
+	XTaskPool   *PoolConfig  `json:"x-task-pool,omitempty"`
 	XRetry      *RetryPolicy `json:"x-retry,omitempty"`
-	XDedupeKey  []string    `json:"x-dedupe-key,omitempty"`
+	XDedupeKey  []string     `json:"x-dedupe-key,omitempty"`
+
+	// WebSocket extensions.
+	XWSEndpoint  string `json:"x-ws-endpoint,omitempty"`
+	XWSMessage   string `json:"x-ws-message,omitempty"`
+	XWSAction    string `json:"x-ws-action,omitempty"`
+	XWSParamsKey string `json:"x-ws-params-key,omitempty"`
 }
 
 type swaggerParameter struct {
@@ -56,32 +71,36 @@ type swaggerParameter struct {
 	Type        string `json:"type,omitempty"`
 	Default     any    `json:"default,omitempty"`
 	XValidate   string `json:"x-validate,omitempty"`
+	XWSType     string `json:"x-ws-type,omitempty"`
 }
 
 type swaggerResponse struct {
 	Description string `json:"description"`
 }
 
-// BuildOpenAPISpec dynamically generates a Swagger 2.0 JSON document from the
-// registered action handlers. Each action is exposed as a POST path under
-// /actions/{actionName}/start with formData parameters derived from the
-// action's ParamSpec metadata. Returns the JSON-encoded spec; on error it
-// logs and returns a minimal valid spec.
+// BuildOpenAPISpec dynamically generates a Swagger 2.0 JSON document. WS commands and
+// action start operations are exposed as "ws" method path items (an intentionally invalid
+// HTTP method that sticky-bb intercepts for its WS console). Standard HTTP paths are not
+// generated for WS operations. Returns the JSON-encoded spec; on error it logs and returns
+// a minimal valid spec.
 func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 	spec := swaggerSpec{
 		Swagger: "2.0",
 		Info: swaggerInfo{
 			Title:       "sticky-overseer",
-			Description: "WebSocket-based process overseer — REST action discovery endpoint. Use /ws for the full WebSocket API.",
+			Description: "WebSocket-based process overseer — use /ws for the full WebSocket API.",
 			Version:     version,
 		},
 		Produces: []string{"application/json"},
-		Paths:    make(map[string]swaggerPathItem),
+		XWebsocketEndpoints: map[string]swaggerWSEndpoint{
+			"/ws": {Label: "WebSocket", TypeField: "type", CorrelationField: "id"},
+		},
+		Paths: make(map[string]swaggerPathItem),
 	}
 
 	// Collect and sort action names for deterministic output.
 	infos := collectActions(actions)
-	tags := make([]swaggerTag, 0, len(infos))
+	actionTags := make([]swaggerTag, 0, len(infos))
 
 	for _, info := range infos {
 		// Build tag per action.
@@ -89,7 +108,7 @@ func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 		if tagDesc == "" {
 			tagDesc = info.Type + " action"
 		}
-		tags = append(tags, swaggerTag{
+		actionTags = append(actionTags, swaggerTag{
 			Name:        info.Name,
 			Description: tagDesc,
 		})
@@ -97,45 +116,43 @@ func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 		// Build form parameters from ParamSpec.
 		params := buildSwaggerParams(info.Params)
 
-		// Build the operation.
+		// Build WS operation for this action at /ws/actions/{name}.
 		summary := "Start " + info.Name + " task"
 		if info.Description != "" {
 			summary = info.Description
 		}
 
-		op := &swaggerOperation{
-			Summary:     summary,
-			OperationID: "start-" + info.Name,
-			Tags:        []string{info.Name},
-			Consumes:    []string{"application/x-www-form-urlencoded"},
-			Parameters:  params,
-			Responses: map[string]swaggerResponse{
-				"200": {Description: "Task started or queued"},
-				"400": {Description: "Invalid parameters"},
-				"409": {Description: "Task already active or duplicate"},
-			},
-			XActionType: info.Type,
-		}
+		wsOp := buildWSCommandOperation(summary, "", "start-"+info.Name, "start", params)
+		wsOp.Tags = []string{info.Name}
+		wsOp.XWSAction = info.Name
+		wsOp.XWSParamsKey = "params"
+		wsOp.XActionType = info.Type
 
 		// Include optional metadata as extensions only when populated.
 		if info.TaskPool.Limit > 0 || info.TaskPool.Queue != nil {
 			pool := info.TaskPool
-			op.XTaskPool = &pool
+			wsOp.XTaskPool = &pool
 		}
 		if info.Retry != nil {
-			op.XRetry = info.Retry
+			wsOp.XRetry = info.Retry
 		}
 		if len(info.DedupeKey) > 0 {
-			op.XDedupeKey = info.DedupeKey
+			wsOp.XDedupeKey = info.DedupeKey
 		}
 
-		path := "/actions/" + info.Name + "/start"
-		spec.Paths[path] = swaggerPathItem{Post: op}
+		path := "/ws/actions/" + info.Name
+		spec.Paths[path] = swaggerPathItem{WS: wsOp}
 	}
 
-	// Sort tags by name (collectActions already sorts infos, so this mirrors it).
-	sort.Slice(tags, func(i, j int) bool { return tags[i].Name < tags[j].Name })
-	spec.Tags = tags
+	// ws-commands tag first, then action tags sorted alphabetically.
+	sort.Slice(actionTags, func(i, j int) bool { return actionTags[i].Name < actionTags[j].Name })
+	spec.Tags = append(
+		[]swaggerTag{{Name: "ws-commands", Description: "Standard WebSocket protocol commands"}},
+		actionTags...,
+	)
+
+	// Add standard WS protocol command paths.
+	addWSCommandPaths(spec.Paths)
 
 	data, err := json.MarshalIndent(spec, "", "    ")
 	if err != nil {
@@ -143,6 +160,126 @@ func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
 		return []byte(`{"swagger":"2.0","info":{"title":"sticky-overseer","version":"unknown"},"paths":{}}`)
 	}
 	return data
+}
+
+// addWSCommandPaths populates the standard protocol command paths with ws-method operations.
+func addWSCommandPaths(paths map[string]swaggerPathItem) {
+	add := func(path, message, summary, description, opID string, params []swaggerParameter) {
+		paths[path] = swaggerPathItem{
+			WS: buildWSCommandOperation(summary, description, opID, message, params),
+		}
+	}
+
+	add("/ws/list", "list", "List tasks",
+		"List all known tasks, optionally filtered by activity time", "ws-list",
+		[]swaggerParameter{
+			wsParam("since", "Only return tasks active after this time (RFC3339)", "timestamp", false),
+		})
+
+	add("/ws/stop", "stop", "Stop task",
+		"Stop a running or queued task", "ws-stop",
+		[]swaggerParameter{
+			wsParam("task_id", "Task identifier", "uuid", true),
+		})
+
+	add("/ws/reset", "reset", "Reset task",
+		"Restart an errored task, clearing its exit history", "ws-reset",
+		[]swaggerParameter{
+			wsParam("task_id", "Task identifier", "uuid", true),
+		})
+
+	add("/ws/replay", "replay", "Replay task output",
+		"Replay buffered output events for a task directly to the requesting connection", "ws-replay",
+		[]swaggerParameter{
+			wsParam("task_id", "Task identifier", "uuid", true),
+			wsParam("since", "Replay only output after this time (RFC3339)", "timestamp", false),
+		})
+
+	add("/ws/describe", "describe", "Describe actions",
+		"Describe available actions and their parameter schemas", "ws-describe",
+		[]swaggerParameter{
+			wsParam("action", "Action name (omit for all actions)", "string", false),
+		})
+
+	add("/ws/pool_info", "pool_info", "Pool info",
+		"Query current pool state for an action or globally", "ws-pool-info",
+		[]swaggerParameter{
+			wsParam("action", "Action name (omit for all actions)", "string", false),
+		})
+
+	add("/ws/purge", "purge", "Purge queue",
+		"Remove all queued tasks for an action (or all actions)", "ws-purge",
+		[]swaggerParameter{
+			wsParam("action", "Action name (omit for all actions)", "string", false),
+		})
+
+	add("/ws/set_pool", "set_pool", "Set pool limits",
+		"Dynamically update pool limits and queue configuration", "ws-set-pool",
+		[]swaggerParameter{
+			wsParam("action", "Action name (omit for global)", "string", false),
+			wsParam("limit", "New concurrency limit (0=unlimited)", "integer", false),
+			wsParam("queue_size", "New queue size limit", "integer", false),
+			wsParam("excess", "How to handle tasks exceeding the new limit", "object", false),
+		})
+
+	add("/ws/subscribe", "subscribe", "Subscribe to task",
+		"Subscribe to task-specific broadcast events", "ws-subscribe",
+		[]swaggerParameter{
+			wsParam("task_id", "Task identifier", "uuid", true),
+		})
+
+	add("/ws/unsubscribe", "unsubscribe", "Unsubscribe from task",
+		"Unsubscribe from task-specific broadcast events", "ws-unsubscribe",
+		[]swaggerParameter{
+			wsParam("task_id", "Task identifier", "uuid", true),
+		})
+
+	add("/ws/metrics", "metrics", "Get metrics",
+		"Query metrics at global, per-action, or per-task granularity", "ws-metrics",
+		[]swaggerParameter{
+			wsParam("action", "Action name for per-action metrics (mutually exclusive with task_id)", "string", false),
+			wsParam("task_id", "Task ID for per-task metrics (mutually exclusive with action)", "uuid", false),
+		})
+
+	add("/ws/manifest", "manifest", "Get manifest",
+		"Request the full WS Manifest document describing this protocol", "ws-manifest", nil)
+}
+
+// wsParam builds a formData swaggerParameter with the given semantic ws type hint.
+func wsParam(name, description, wsType string, required bool) swaggerParameter {
+	p := swaggerParameter{
+		Name:        name,
+		In:          "formData",
+		Description: description,
+		Required:    required,
+		XWSType:     wsType,
+	}
+	// Map ws type to a valid Swagger formData type.
+	switch wsType {
+	case "integer":
+		p.Type = "integer"
+	default:
+		p.Type = "string"
+	}
+	return p
+}
+
+// buildWSCommandOperation creates a WS-method operation with common ws-commands tag and
+// x-ws-endpoint/x-ws-message extensions pre-filled.
+func buildWSCommandOperation(summary, description, opID, wsMessage string, params []swaggerParameter) *swaggerOperation {
+	return &swaggerOperation{
+		Summary:     summary,
+		Description: description,
+		OperationID: opID,
+		Tags:        []string{"ws-commands"},
+		Consumes:    []string{"application/x-www-form-urlencoded"},
+		Parameters:  params,
+		Responses: map[string]swaggerResponse{
+			"200": {Description: "Message sent"},
+		},
+		XWSEndpoint: "/ws",
+		XWSMessage:  wsMessage,
+	}
 }
 
 // buildSwaggerParams converts a ParamSpec map into an ordered slice of

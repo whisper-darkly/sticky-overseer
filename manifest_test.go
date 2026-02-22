@@ -2,7 +2,6 @@ package overseer
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -157,6 +156,8 @@ func startTCPTransportForTest(t *testing.T, ctx context.Context, tr tcpTransport
 	return ch, addr
 }
 
+// TestManifestHTTPEndpoint verifies that the old /ws/manifest HTTP endpoint is no longer
+// served (manifest is now only accessible via the WS "manifest" message type).
 func TestManifestHTTPEndpoint(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -176,26 +177,8 @@ func TestManifestHTTPEndpoint(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	t.Run("status_200", func(t *testing.T) {
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("status = %d; want 200", resp.StatusCode)
-		}
-	})
-
-	t.Run("content_type_json", func(t *testing.T) {
-		ct := resp.Header.Get("Content-Type")
-		if ct != "application/json" {
-			t.Errorf("Content-Type = %q; want %q", ct, "application/json")
-		}
-	})
-
-	t.Run("manifest_protocol", func(t *testing.T) {
-		var manifest WSManifest
-		if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
-			t.Fatalf("decode manifest: %v", err)
-		}
-		if manifest.Protocol != "sticky-overseer" {
-			t.Errorf("manifest.Protocol = %q; want %q", manifest.Protocol, "sticky-overseer")
-		}
-	})
+	// HTTP endpoint removed — manifest is now WS-only.
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d; want 404 (HTTP manifest endpoint removed)", resp.StatusCode)
+	}
 }

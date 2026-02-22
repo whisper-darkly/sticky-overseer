@@ -154,21 +154,6 @@ func (t tcpTransport) Listen(ctx context.Context) (<-chan Conn, error) {
 		w.Write(spec) //nolint:errcheck
 	})
 
-	// Serve WS Manifest.
-	mux.HandleFunc("/ws/manifest", func(w http.ResponseWriter, r *http.Request) {
-		var actions map[string]ActionHandler
-		if t.hub != nil {
-			t.hub.mu.RLock()
-			actions = t.hub.actions
-			t.hub.mu.RUnlock()
-		}
-		manifest := BuildManifest(actions, t.version)
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(manifest); err != nil {
-			log.Printf("tcp transport: manifest encode error: %v", err)
-		}
-	})
-
 	// WebSocket endpoint.
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if !isTrusted(r, t.trustedNets) {
