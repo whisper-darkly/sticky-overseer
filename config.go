@@ -17,6 +17,7 @@ const (
 
 // Config is the top-level YAML configuration structure.
 type Config struct {
+	Name         string                   `yaml:"name"`
 	Listen       string                   `yaml:"listen"`
 	DB           string                   `yaml:"db"`
 	LogFile      string                   `yaml:"log_file"`

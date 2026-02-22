@@ -109,6 +109,7 @@ type tcpTransport struct {
 	trustedNets []*net.IPNet
 	hub         *Hub
 	version     string
+	name        string
 }
 
 // TrustedNets is a convenience setter used by tests and main.go wiring.
@@ -125,6 +126,11 @@ func (t tcpTransport) withHub(h *Hub) tcpTransport {
 
 func (t tcpTransport) withVersion(v string) tcpTransport {
 	t.version = v
+	return t
+}
+
+func (t tcpTransport) withName(n string) tcpTransport {
+	t.name = n
 	return t
 }
 
@@ -149,7 +155,7 @@ func (t tcpTransport) Listen(ctx context.Context) (<-chan Conn, error) {
 			actions = t.hub.actions
 			t.hub.mu.RUnlock()
 		}
-		spec := BuildOpenAPISpec(actions, t.version)
+		spec := BuildOpenAPISpec(actions, t.version, t.name)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(spec) //nolint:errcheck
 	})

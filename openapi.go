@@ -106,11 +106,14 @@ type swaggerResponse struct {
 // conventions such as the type discriminator and action routing are expressed
 // as hidden parameters with default values — sticky-bb has no knowledge of
 // overseer-specific field names.
-func BuildOpenAPISpec(actions map[string]ActionHandler, version string) []byte {
+func BuildOpenAPISpec(actions map[string]ActionHandler, version, name string) []byte {
+	if name == "" {
+		name = "sticky-overseer"
+	}
 	spec := swaggerSpec{
 		Swagger: "2.0",
 		Info: swaggerInfo{
-			Title:       "sticky-overseer",
+			Title:       name,
 			Description: "WebSocket-based process overseer — use /ws for the full WebSocket API.",
 			Version:     version,
 		},

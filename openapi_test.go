@@ -36,7 +36,7 @@ func wsOpFromSpec(t *testing.T, spec map[string]any) map[string]any {
 // ---------------------------------------------------------------------------
 
 func TestBuildOpenAPISpec_structure(t *testing.T) {
-	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "v1.2.3"))
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "v1.2.3", ""))
 
 	if got, _ := spec["swagger"].(string); got != "2.0" {
 		t.Errorf(`swagger = %v; want "2.0"`, spec["swagger"])
@@ -44,6 +44,13 @@ func TestBuildOpenAPISpec_structure(t *testing.T) {
 	info, _ := spec["info"].(map[string]any)
 	if info["title"] != "sticky-overseer" {
 		t.Errorf(`info.title = %v; want "sticky-overseer"`, info["title"])
+	}
+
+	// Named instance
+	specNamed := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "v1.2.3", "My Recorder"))
+	infoNamed, _ := specNamed["info"].(map[string]any)
+	if infoNamed["title"] != "My Recorder" {
+		t.Errorf(`info.title (named) = %v; want "My Recorder"`, infoNamed["title"])
 	}
 	if info["version"] != "v1.2.3" {
 		t.Errorf(`info.version = %v; want "v1.2.3"`, info["version"])
@@ -92,7 +99,7 @@ func TestBuildOpenAPISpec_actions(t *testing.T) {
 		"echo": &stubHandler{info: ActionInfo{Name: "echo", Type: "exec"}},
 	}
 
-	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "2.0.0"))
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "2.0.0", ""))
 
 	// Still only /ws — no separate action paths
 	paths, _ := spec["paths"].(map[string]any)
@@ -193,7 +200,7 @@ func TestBuildOpenAPISpec_tags(t *testing.T) {
 		"alpha": &stubHandler{info: ActionInfo{Name: "alpha", Type: "exec", Description: "Alpha action"}},
 	}
 
-	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0"))
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0", ""))
 
 	// Tags are no longer emitted — the spec should have no top-level tags array.
 	if _, exists := spec["tags"]; exists {
@@ -217,7 +224,7 @@ func TestBuildOpenAPISpec_extensions(t *testing.T) {
 		},
 	}
 
-	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0"))
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0", ""))
 	wsOp := wsOpFromSpec(t, spec)
 	cmds, _ := wsOp["commands"].([]any)
 
@@ -252,7 +259,7 @@ func TestBuildOpenAPISpec_extensions(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestBuildOpenAPISpec_wsCommands(t *testing.T) {
-	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "1.0.0"))
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "1.0.0", ""))
 	wsOp := wsOpFromSpec(t, spec)
 	cmds, _ := wsOp["commands"].([]any)
 
