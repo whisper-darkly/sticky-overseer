@@ -383,7 +383,7 @@ func TestStart_SameTaskIDWhileRunning(t *testing.T) {
 	}
 
 	// Cleanup: stop the running task
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dup-task"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dup-task", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -439,7 +439,7 @@ func TestReset_NonErroredTask(t *testing.T) {
 	}
 
 	// Cleanup
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "reset-task"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "reset-task", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -513,6 +513,7 @@ func TestShutdown_ContextTimeout(t *testing.T) {
 	e := newHubEnv(t, nil)
 	e.send(t, map[string]interface{}{
 		"type":   "start",
+		"id":     "s1",
 		"action": "sleep",
 		"params": map[string]string{"duration": "60"},
 	})
@@ -535,6 +536,26 @@ func TestShutdown_ContextTimeout(t *testing.T) {
 }
 
 // --- Message handler edge cases ---
+
+// TestMissingCorrelationID verifies that messages without an "id" field are rejected.
+func TestMissingCorrelationID(t *testing.T) {
+	e := newHubEnv(t, nil)
+	e.send(t, map[string]interface{}{"type": "list"})
+	m := e.readMsg(t)
+	if msgType(m) != "error" {
+		t.Errorf("expected error for missing id, got %q", msgType(m))
+	}
+	msg, _ := m["message"].(string)
+	if !strings.Contains(msg, "id is required") {
+		t.Errorf("expected 'id is required' in error message, got: %q", msg)
+	}
+	// Verify the connection is still usable after the error.
+	e.send(t, map[string]interface{}{"type": "list", "id": "l1"})
+	m2 := e.readMsg(t)
+	if msgType(m2) != "tasks" {
+		t.Errorf("expected tasks after valid request, got %q", msgType(m2))
+	}
+}
 
 func TestHandleUnknownMessageType(t *testing.T) {
 	e := newHubEnv(t, nil)
@@ -582,6 +603,7 @@ func TestHandleList_SinceFilter_ExcludesOldTasks(t *testing.T) {
 	e := newHubEnv(t, nil)
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "old-task",
 		"action":  "echo",
 		"params":  map[string]string{"msg": "hi"},
@@ -630,7 +652,7 @@ func TestHandleStop_MissingTaskID(t *testing.T) {
 
 func TestHandleStop_NotFound(t *testing.T) {
 	e := newHubEnv(t, nil)
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "ghost"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "ghost", "id": "s1"})
 	m := e.readMsg(t)
 	if msgType(m) != "error" {
 		t.Errorf("expected error for unknown task, got %q", msgType(m))
@@ -650,7 +672,7 @@ func TestHandleReset_MissingTaskID(t *testing.T) {
 
 func TestHandleReset_NotFound(t *testing.T) {
 	e := newHubEnv(t, nil)
-	e.send(t, map[string]interface{}{"type": "reset", "task_id": "ghost"})
+	e.send(t, map[string]interface{}{"type": "reset", "task_id": "ghost", "id": "r1"})
 	m := e.readMsg(t)
 	if msgType(m) != "error" {
 		t.Errorf("expected error for unknown task, got %q", msgType(m))
@@ -685,7 +707,7 @@ func TestReset_ErroredTask_Restarts(t *testing.T) {
 		t.Errorf("started task_id: got %q want errored-task", tid)
 	}
 	// Task restarts again and will error again; just stop it.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "errored-task"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "errored-task", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -704,7 +726,7 @@ func TestHandleReplay_MissingTaskID(t *testing.T) {
 
 func TestHandleReplay_NotFound(t *testing.T) {
 	e := newHubEnv(t, nil)
-	e.send(t, map[string]interface{}{"type": "replay", "task_id": "ghost"})
+	e.send(t, map[string]interface{}{"type": "replay", "task_id": "ghost", "id": "r1"})
 	m := e.readMsg(t)
 	if msgType(m) != "error" {
 		t.Errorf("expected error for unknown task, got %q", msgType(m))
@@ -739,6 +761,7 @@ func TestHandleReplay_InvalidSince(t *testing.T) {
 	e := newHubEnv(t, nil)
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "rs-inv",
 		"action":  "sleep",
 		"params":  map[string]string{"duration": "10"},
@@ -747,13 +770,13 @@ func TestHandleReplay_InvalidSince(t *testing.T) {
 		return msgType(m) == "started"
 	})
 
-	e.send(t, map[string]interface{}{"type": "replay", "task_id": "rs-inv", "since": "garbage"})
+	e.send(t, map[string]interface{}{"type": "replay", "id": "r1", "task_id": "rs-inv", "since": "garbage"})
 	m := e.readMsg(t)
 	if msgType(m) != "error" {
 		t.Errorf("expected error for invalid since, got %q", msgType(m))
 	}
 
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "rs-inv"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "rs-inv", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -765,6 +788,7 @@ func TestHandleReplay_SinceFilter_Future(t *testing.T) {
 	e := newHubEnv(t, nil)
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "rsfuture",
 		"action":  "echo",
 		"params":  map[string]string{"msg": "hello"},
@@ -780,7 +804,7 @@ func TestHandleReplay_SinceFilter_Future(t *testing.T) {
 	e.buf = nil
 
 	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
-	e.send(t, map[string]interface{}{"type": "replay", "task_id": taskID, "since": future})
+	e.send(t, map[string]interface{}{"type": "replay", "id": "r1", "task_id": taskID, "since": future})
 
 	// Nothing should arrive within a short window.
 	e.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
@@ -818,7 +842,7 @@ func TestRetryPolicy_RestartOnExit(t *testing.T) {
 	})
 
 	// Stop the task to prevent an infinite restart loop.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "restart-task"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "restart-task", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -1127,6 +1151,7 @@ func TestAutoSubscribeOnStart(t *testing.T) {
 	// connA (e.conn) starts the echo task.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "sub-auto-1",
 		"action":  "echo",
 		"params":  map[string]string{"msg": "hello-subscribe"},
@@ -1163,6 +1188,7 @@ func TestManualSubscribe(t *testing.T) {
 	// connA starts a sleep task.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "sub-manual-1",
 		"action":  "sleep",
 		"params":  map[string]string{"duration": "5"},
@@ -1191,7 +1217,7 @@ func TestManualSubscribe(t *testing.T) {
 	}
 
 	// Stop the task via connA to generate an exited event.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "sub-manual-1"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "sub-manual-1", "id": "cleanup"})
 
 	// connB should receive the exited event because it subscribed.
 	msg, ok := readUntilOnConn(t, connB, 5*time.Second, func(m map[string]interface{}) bool {
@@ -1214,6 +1240,7 @@ func TestUnsubscribe(t *testing.T) {
 	// connA starts a sleep task and thus auto-subscribes.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "unsub-task-1",
 		"action":  "sleep",
 		"params":  map[string]string{"duration": "60"},
@@ -1233,7 +1260,7 @@ func TestUnsubscribe(t *testing.T) {
 	})
 
 	// Stop the task to generate an exited event.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "unsub-task-1"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "unsub-task-1", "id": "cleanup"})
 
 	// connA should NOT receive the exited event now that it unsubscribed.
 	e.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
@@ -1280,6 +1307,7 @@ func TestDedup_RejectDuplicate(t *testing.T) {
 	// Start first task.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "req1",
 		"task_id": "dedup-1",
 		"action":  "dedup-sleep",
 		"params":  map[string]string{"key": "same-value"},
@@ -1308,7 +1336,7 @@ func TestDedup_RejectDuplicate(t *testing.T) {
 	}
 
 	// Clean up: stop the first task.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-1"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-1", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -1325,6 +1353,7 @@ func TestDedup_DifferentParams_BothStart(t *testing.T) {
 	// Start first task.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "req1",
 		"task_id": "dedup-diff-1",
 		"action":  "dedup-sleep",
 		"params":  map[string]string{"key": "value-a"},
@@ -1349,8 +1378,8 @@ func TestDedup_DifferentParams_BothStart(t *testing.T) {
 	}
 
 	// Clean up.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-diff-1"})
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-diff-2"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-diff-1", "id": "cleanup1"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-diff-2", "id": "cleanup2"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -1402,6 +1431,7 @@ func TestOutputSeqNumbers(t *testing.T) {
 	// Send echo with 3 words separated by newlines.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "s1",
 		"task_id": "seq-task",
 		"action":  "seq-echo",
 		"params":  map[string]string{"msg": "line1\nline2\nline3"},
@@ -1533,6 +1563,7 @@ func TestDedup_AfterExited_AllowsRestart(t *testing.T) {
 	// testDedupeEchoHandler starts "sleep 60", so stop it to simulate exit.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "req1",
 		"task_id": "dedup-exit-1",
 		"action":  "dedup-short",
 		"params":  map[string]string{"key": "restart-val"},
@@ -1542,7 +1573,7 @@ func TestDedup_AfterExited_AllowsRestart(t *testing.T) {
 	})
 
 	// Stop the task so it exits.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-exit-1"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-exit-1", "id": "stop1"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -1568,7 +1599,7 @@ func TestDedup_AfterExited_AllowsRestart(t *testing.T) {
 	}
 
 	// Clean up.
-	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-exit-2"})
+	e.send(t, map[string]interface{}{"type": "stop", "task_id": "dedup-exit-2", "id": "cleanup"})
 	e.readUntil(t, 5*time.Second, func(m map[string]interface{}) bool {
 		return msgType(m) == "exited"
 	})
@@ -1587,6 +1618,7 @@ func TestSeqNumbersResetPerTask(t *testing.T) {
 	// Start task A — subscribe connB so we get events even though connA started it.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "sa1",
 		"task_id": "seq-a",
 		"action":  "seq-echo",
 		"params":  map[string]string{"msg": "lineA"},
@@ -1598,6 +1630,7 @@ func TestSeqNumbersResetPerTask(t *testing.T) {
 	// Start task B.
 	e.send(t, map[string]interface{}{
 		"type":    "start",
+		"id":      "sb1",
 		"task_id": "seq-b",
 		"action":  "seq-echo",
 		"params":  map[string]string{"msg": "lineB"},

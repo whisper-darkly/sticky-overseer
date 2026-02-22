@@ -140,7 +140,7 @@ type IncomingMessage struct {
 
 type StartedMessage struct {
 	Type      string    `json:"type"`
-	ID        string    `json:"id,omitempty"`
+	ID        string    `json:"id"`
 	TaskID    string    `json:"task_id"`
 	PID       int       `json:"pid"`
 	RestartOf int       `json:"restart_of,omitempty"`
@@ -166,7 +166,7 @@ type TaskInfo struct {
 
 type TasksMessage struct {
 	Type  string     `json:"type"`
-	ID    string     `json:"id,omitempty"`
+	ID    string     `json:"id"`
 	Tasks []TaskInfo `json:"tasks"`
 }
 
@@ -230,7 +230,7 @@ type ErroredMessage struct {
 
 type ErrorMessage struct {
 	Type           string `json:"type"`
-	ID             string `json:"id,omitempty"`
+	ID             string `json:"id"`
 	Message        string `json:"message"`
 	ExistingTaskID string `json:"existing_task_id,omitempty"` // set on duplicate task detection
 }
@@ -240,7 +240,7 @@ type ErrorMessage struct {
 // QueuedMessage is broadcast when a task is accepted but placed in the queue.
 type QueuedMessage struct {
 	Type     string    `json:"type"`
-	ID       string    `json:"id,omitempty"`
+	ID       string    `json:"id"`
 	TaskID   string    `json:"task_id"`
 	Action   string    `json:"action"`
 	Position int       `json:"position"`
@@ -259,7 +259,7 @@ type DequeuedMessage struct {
 // ActionInfo is defined in actions.go.
 type ActionsMessage struct {
 	Type    string       `json:"type"`
-	ID      string       `json:"id,omitempty"`
+	ID      string       `json:"id"`
 	Actions []ActionInfo `json:"actions"`
 }
 
@@ -267,7 +267,7 @@ type ActionsMessage struct {
 // PoolInfo is defined in pool.go.
 type PoolMessage struct {
 	Type   string   `json:"type"`
-	ID     string   `json:"id,omitempty"`
+	ID     string   `json:"id"`
 	Action string   `json:"action,omitempty"`
 	Pool   PoolInfo `json:"pool"`
 }
@@ -275,7 +275,7 @@ type PoolMessage struct {
 // PurgedMessage is sent after a successful "purge" request.
 type PurgedMessage struct {
 	Type   string `json:"type"`
-	ID     string `json:"id,omitempty"`
+	ID     string `json:"id"`
 	Action string `json:"action,omitempty"`
 	Count  int    `json:"count"`
 }
@@ -305,8 +305,8 @@ type GlobalMetricsSnapshot struct {
 // Exactly one of Global, Action, or Task will be non-nil depending on the
 // requested granularity (default=global, action=per-action, task_id=per-task).
 type MetricsMessage struct {
-	Type   string                 `json:"type"`             // "metrics"
-	ID     string                 `json:"id,omitempty"`
+	Type   string                 `json:"type"` // "metrics"
+	ID     string                 `json:"id"`
 	Global *GlobalMetricsSnapshot `json:"global,omitempty"`
 	Action *ActionMetrics         `json:"action,omitempty"`
 	Task   *TaskMetrics           `json:"task,omitempty"`
@@ -314,22 +314,22 @@ type MetricsMessage struct {
 
 // SubscribedMessage confirms a successful subscribe request.
 type SubscribedMessage struct {
-	Type   string `json:"type"`   // "subscribed"
-	ID     string `json:"id,omitempty"`
+	Type   string `json:"type"` // "subscribed"
+	ID     string `json:"id"`
 	TaskID string `json:"task_id"`
 }
 
 // UnsubscribedMessage confirms a successful unsubscribe request.
 type UnsubscribedMessage struct {
-	Type   string `json:"type"`   // "unsubscribed"
-	ID     string `json:"id,omitempty"`
+	Type   string `json:"type"` // "unsubscribed"
+	ID     string `json:"id"`
 	TaskID string `json:"task_id"`
 }
 
 // ManifestWireMessage is the WS response to a "manifest" client request.
 type ManifestWireMessage struct {
 	Type     string     `json:"type"`
-	ID       string     `json:"id,omitempty"`
+	ID       string     `json:"id"`
 	Manifest WSManifest `json:"manifest"`
 }
 

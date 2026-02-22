@@ -459,6 +459,11 @@ func (h *Hub) HandleClient(conn Conn) {
 			break
 		}
 
+		if msg.ID == "" {
+			h.sendError(conn, "", "id is required")
+			continue
+		}
+
 		switch msg.Type {
 		case "start":
 			h.handleStart(conn, msg)
