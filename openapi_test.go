@@ -6,26 +6,42 @@ import (
 	"testing"
 )
 
-// ---------------------------------------------------------------------------
-// TestBuildOpenAPISpec_structure — verifies Swagger 2.0 envelope
-// ---------------------------------------------------------------------------
-
-func TestBuildOpenAPISpec_structure(t *testing.T) {
-	data := BuildOpenAPISpec(nil, "v1.2.3")
-
+// helper: unmarshal spec, assert no error
+func mustUnmarshalSpec(t *testing.T, data []byte) map[string]any {
+	t.Helper()
 	var spec map[string]any
 	if err := json.Unmarshal(data, &spec); err != nil {
 		t.Fatalf("BuildOpenAPISpec returned invalid JSON: %v", err)
 	}
+	return spec
+}
 
-	if got, ok := spec["swagger"].(string); !ok || got != "2.0" {
+// helper: navigate spec["paths"]["/ws"]["ws"] → map
+func wsOpFromSpec(t *testing.T, spec map[string]any) map[string]any {
+	t.Helper()
+	paths, _ := spec["paths"].(map[string]any)
+	wsPath, ok := paths["/ws"].(map[string]any)
+	if !ok {
+		t.Fatal("missing /ws path item")
+	}
+	wsOp, ok := wsPath["ws"].(map[string]any)
+	if !ok {
+		t.Fatal("missing ws operation on /ws path item")
+	}
+	return wsOp
+}
+
+// ---------------------------------------------------------------------------
+// TestBuildOpenAPISpec_structure
+// ---------------------------------------------------------------------------
+
+func TestBuildOpenAPISpec_structure(t *testing.T) {
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "v1.2.3"))
+
+	if got, _ := spec["swagger"].(string); got != "2.0" {
 		t.Errorf(`swagger = %v; want "2.0"`, spec["swagger"])
 	}
-
-	info, ok := spec["info"].(map[string]any)
-	if !ok {
-		t.Fatal("info field missing or wrong type")
-	}
+	info, _ := spec["info"].(map[string]any)
 	if info["title"] != "sticky-overseer" {
 		t.Errorf(`info.title = %v; want "sticky-overseer"`, info["title"])
 	}
@@ -33,33 +49,34 @@ func TestBuildOpenAPISpec_structure(t *testing.T) {
 		t.Errorf(`info.version = %v; want "v1.2.3"`, info["version"])
 	}
 
-	// With nil actions, we still get the standard WS command paths.
-	paths, ok := spec["paths"].(map[string]any)
-	if !ok {
-		t.Fatal("paths field missing or wrong type")
-	}
-	// Standard protocol commands: list, stop, reset, replay, describe, pool_info,
-	// purge, set_pool, subscribe, unsubscribe, metrics, manifest = 12 paths.
-	if len(paths) != 12 {
-		t.Errorf("expected 12 standard WS command paths for nil actions, got %d", len(paths))
+	// Exactly one path: /ws
+	paths, _ := spec["paths"].(map[string]any)
+	if len(paths) != 1 {
+		t.Errorf("expected 1 path (/ws), got %d", len(paths))
 	}
 
-	// Verify x-websocket-endpoints is present.
-	xws, ok := spec["x-websocket-endpoints"].(map[string]any)
-	if !ok {
-		t.Fatal("x-websocket-endpoints field missing or wrong type")
+	wsOp := wsOpFromSpec(t, spec)
+	if wsOp["type_field"] != "type" {
+		t.Errorf("ws.type_field = %v; want type", wsOp["type_field"])
 	}
-	ws, ok := xws["/ws"].(map[string]any)
-	if !ok {
-		t.Fatal("x-websocket-endpoints['/ws'] missing or wrong type")
+	if wsOp["correlation_field"] != "id" {
+		t.Errorf("ws.correlation_field = %v; want id", wsOp["correlation_field"])
 	}
-	if ws["type_field"] != "type" {
-		t.Errorf(`x-websocket-endpoints["/ws"].type_field = %v; want "type"`, ws["type_field"])
+
+	// 12 standard protocol commands when no actions registered
+	cmds, _ := wsOp["commands"].([]any)
+	if len(cmds) != 12 {
+		t.Errorf("expected 12 standard commands for nil actions, got %d", len(cmds))
+	}
+
+	// No x-websocket-endpoints root extension
+	if _, exists := spec["x-websocket-endpoints"]; exists {
+		t.Error("unexpected x-websocket-endpoints in spec")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestBuildOpenAPISpec_actions — verifies action paths and params
+// TestBuildOpenAPISpec_actions
 // ---------------------------------------------------------------------------
 
 func TestBuildOpenAPISpec_actions(t *testing.T) {
@@ -71,105 +88,106 @@ func TestBuildOpenAPISpec_actions(t *testing.T) {
 				Type:        "exec",
 				Description: "Greet someone",
 				Params: map[string]*ParamSpec{
-					"name":   nil, // required
+					"name":   nil,
 					"suffix": {Default: &defVal, Validate: `value != ""`},
 				},
 			},
 		},
-		"echo": &stubHandler{
-			info: ActionInfo{
-				Name: "echo",
-				Type: "exec",
-			},
-		},
+		"echo": &stubHandler{info: ActionInfo{Name: "echo", Type: "exec"}},
 	}
 
-	data := BuildOpenAPISpec(actions, "2.0.0")
-	var spec map[string]any
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "2.0.0"))
 
+	// Still only /ws — no separate action paths
 	paths, _ := spec["paths"].(map[string]any)
-	// 12 standard WS commands + 2 action paths = 14.
-	if len(paths) != 14 {
-		t.Fatalf("expected 14 paths (12 standard + 2 actions), got %d", len(paths))
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path (/ws), got %d: %v", len(paths), paths)
 	}
 
-	// Verify greet path exists at /ws/actions/greet with ws method.
-	greetPath, ok := paths["/ws/actions/greet"].(map[string]any)
-	if !ok {
-		t.Fatal("missing /ws/actions/greet path")
-	}
-	wsOp, ok := greetPath["ws"].(map[string]any)
-	if !ok {
-		t.Fatal("missing ws operation for /ws/actions/greet")
+	wsOp := wsOpFromSpec(t, spec)
+	cmds, _ := wsOp["commands"].([]any)
+	// 12 standard + 2 actions = 14
+	if len(cmds) != 14 {
+		t.Fatalf("expected 14 commands (12 standard + 2 actions), got %d", len(cmds))
 	}
 
-	// Check operationId.
-	if wsOp["operationId"] != "start-greet" {
-		t.Errorf("operationId = %v; want start-greet", wsOp["operationId"])
+	// Find the greet command
+	var greetCmd map[string]any
+	for _, c := range cmds {
+		cmd := c.(map[string]any)
+		if cmd["action"] == "greet" {
+			greetCmd = cmd
+			break
+		}
+	}
+	if greetCmd == nil {
+		t.Fatal("greet action command not found in commands")
 	}
 
-	// Check x-action-type.
-	if wsOp["x-action-type"] != "exec" {
-		t.Errorf("x-action-type = %v; want exec", wsOp["x-action-type"])
+	if greetCmd["message"] != "start" {
+		t.Errorf("greet message = %v; want start", greetCmd["message"])
+	}
+	if greetCmd["operationId"] != "start-greet" {
+		t.Errorf("greet operationId = %v; want start-greet", greetCmd["operationId"])
+	}
+	if greetCmd["params_key"] != "params" {
+		t.Errorf("greet params_key = %v; want params", greetCmd["params_key"])
+	}
+	if greetCmd["x-action-type"] != "exec" {
+		t.Errorf("greet x-action-type = %v; want exec", greetCmd["x-action-type"])
 	}
 
-	// Check x-ws-message and x-ws-action.
-	if wsOp["x-ws-message"] != "start" {
-		t.Errorf("x-ws-message = %v; want start", wsOp["x-ws-message"])
-	}
-	if wsOp["x-ws-action"] != "greet" {
-		t.Errorf("x-ws-action = %v; want greet", wsOp["x-ws-action"])
-	}
-	if wsOp["x-ws-params-key"] != "params" {
-		t.Errorf("x-ws-params-key = %v; want params", wsOp["x-ws-params-key"])
-	}
-
-	// Check parameters include both name (required) and suffix (optional).
-	rawParams, _ := wsOp["parameters"].([]any)
+	rawParams, _ := greetCmd["parameters"].([]any)
 	if len(rawParams) != 2 {
-		t.Fatalf("expected 2 parameters, got %d", len(rawParams))
+		t.Fatalf("greet: expected 2 parameters, got %d", len(rawParams))
 	}
 
-	// Required param should come first.
+	// Required param first
 	p0, _ := rawParams[0].(map[string]any)
 	if p0["name"] != "name" {
-		t.Errorf("first param name = %v; want name", p0["name"])
+		t.Errorf("first param = %v; want name", p0["name"])
 	}
 	if p0["required"] != true {
-		t.Errorf("name param required = %v; want true", p0["required"])
+		t.Errorf("name required = %v; want true", p0["required"])
+	}
+	// Type is "string" (default from ParamSpec)
+	if p0["type"] != "string" {
+		t.Errorf("name type = %v; want string", p0["type"])
 	}
 
 	p1, _ := rawParams[1].(map[string]any)
 	if p1["name"] != "suffix" {
-		t.Errorf("second param name = %v; want suffix", p1["name"])
+		t.Errorf("second param = %v; want suffix", p1["name"])
 	}
-	if p1["required"] != false {
-		t.Errorf("suffix param required = %v; want false", p1["required"])
+	if p1["required"] == true {
+		t.Errorf("suffix required = true; want false/omitted")
 	}
 	if p1["default"] != defVal {
-		t.Errorf("suffix param default = %v; want %q", p1["default"], defVal)
+		t.Errorf("suffix default = %v; want %q", p1["default"], defVal)
 	}
-	if !strings.Contains(p1["x-validate"].(string), "value") {
-		t.Errorf("suffix x-validate = %v; expected CEL expression", p1["x-validate"])
+	if validate, _ := p1["validate"].(string); !strings.Contains(validate, "value") {
+		t.Errorf("suffix validate = %v; expected CEL expression", p1["validate"])
 	}
 
-	// Verify echo path exists with no parameters.
-	echoPath, ok := paths["/ws/actions/echo"].(map[string]any)
-	if !ok {
-		t.Fatal("missing /ws/actions/echo path")
+	// echo command: no parameters
+	var echoCmd map[string]any
+	for _, c := range cmds {
+		cmd := c.(map[string]any)
+		if cmd["action"] == "echo" {
+			echoCmd = cmd
+			break
+		}
 	}
-	echoWS, _ := echoPath["ws"].(map[string]any)
-	echoParams := echoWS["parameters"]
-	if echoParams != nil {
-		t.Errorf("echo should have no parameters, got %v", echoParams)
+	if echoCmd == nil {
+		t.Fatal("echo action command not found")
+	}
+	if echoCmd["parameters"] != nil {
+		t.Errorf("echo should have no parameters, got %v", echoCmd["parameters"])
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestBuildOpenAPISpec_tags — verifies tags list
+// TestBuildOpenAPISpec_tags
 // ---------------------------------------------------------------------------
 
 func TestBuildOpenAPISpec_tags(t *testing.T) {
@@ -178,33 +196,24 @@ func TestBuildOpenAPISpec_tags(t *testing.T) {
 		"alpha": &stubHandler{info: ActionInfo{Name: "alpha", Type: "exec", Description: "Alpha action"}},
 	}
 
-	data := BuildOpenAPISpec(actions, "1.0.0")
-	var spec map[string]any
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0"))
 
 	tags, _ := spec["tags"].([]any)
-	// ws-commands + alpha + beta = 3 tags.
 	if len(tags) != 3 {
 		t.Fatalf("expected 3 tags (ws-commands + 2 actions), got %d", len(tags))
 	}
-
-	// ws-commands tag should be first.
 	first, _ := tags[0].(map[string]any)
 	if first["name"] != "ws-commands" {
 		t.Errorf("first tag = %v; want ws-commands", first["name"])
 	}
-
-	// Action tags should be sorted alphabetically after ws-commands.
 	second, _ := tags[1].(map[string]any)
 	if second["name"] != "alpha" {
-		t.Errorf("second tag = %v; want alpha (alphabetical order)", second["name"])
+		t.Errorf("second tag = %v; want alpha", second["name"])
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestBuildOpenAPISpec_extensions — verifies x-task-pool, x-retry, x-dedupe-key
+// TestBuildOpenAPISpec_extensions — x-task-pool, x-retry, x-dedupe-key
 // ---------------------------------------------------------------------------
 
 func TestBuildOpenAPISpec_extensions(t *testing.T) {
@@ -219,92 +228,103 @@ func TestBuildOpenAPISpec_extensions(t *testing.T) {
 		},
 	}
 
-	data := BuildOpenAPISpec(actions, "1.0.0")
-	var spec map[string]any
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(actions, "1.0.0"))
+	wsOp := wsOpFromSpec(t, spec)
+	cmds, _ := wsOp["commands"].([]any)
+
+	var workerCmd map[string]any
+	for _, c := range cmds {
+		cmd := c.(map[string]any)
+		if cmd["action"] == "worker" {
+			workerCmd = cmd
+			break
+		}
+	}
+	if workerCmd == nil {
+		t.Fatal("worker command not found")
 	}
 
-	paths, _ := spec["paths"].(map[string]any)
-	path, _ := paths["/ws/actions/worker"].(map[string]any)
-	wsOp, _ := path["ws"].(map[string]any)
-
-	pool, ok := wsOp["x-task-pool"].(map[string]any)
+	pool, ok := workerCmd["x-task-pool"].(map[string]any)
 	if !ok {
-		t.Fatal("x-task-pool extension missing")
+		t.Fatal("x-task-pool missing")
 	}
 	if pool["limit"].(float64) != 3 {
 		t.Errorf("x-task-pool.limit = %v; want 3", pool["limit"])
 	}
 
-	dedupeKey, _ := wsOp["x-dedupe-key"].([]any)
+	dedupeKey, _ := workerCmd["x-dedupe-key"].([]any)
 	if len(dedupeKey) != 1 || dedupeKey[0] != "url" {
 		t.Errorf("x-dedupe-key = %v; want [url]", dedupeKey)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// TestBuildOpenAPISpec_wsCommands — verifies standard WS command paths
+// TestBuildOpenAPISpec_wsCommands — standard protocol commands
 // ---------------------------------------------------------------------------
 
 func TestBuildOpenAPISpec_wsCommands(t *testing.T) {
-	data := BuildOpenAPISpec(nil, "1.0.0")
-	var spec map[string]any
-	if err := json.Unmarshal(data, &spec); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
+	spec := mustUnmarshalSpec(t, BuildOpenAPISpec(nil, "1.0.0"))
+	wsOp := wsOpFromSpec(t, spec)
+	cmds, _ := wsOp["commands"].([]any)
 
-	paths, _ := spec["paths"].(map[string]any)
-
-	expectedCommands := []struct {
-		path    string
-		message string
-	}{
-		{"/ws/list", "list"},
-		{"/ws/stop", "stop"},
-		{"/ws/reset", "reset"},
-		{"/ws/replay", "replay"},
-		{"/ws/describe", "describe"},
-		{"/ws/pool_info", "pool_info"},
-		{"/ws/purge", "purge"},
-		{"/ws/set_pool", "set_pool"},
-		{"/ws/subscribe", "subscribe"},
-		{"/ws/unsubscribe", "unsubscribe"},
-		{"/ws/metrics", "metrics"},
-		{"/ws/manifest", "manifest"},
-	}
-
-	for _, tc := range expectedCommands {
-		pathItem, ok := paths[tc.path].(map[string]any)
-		if !ok {
-			t.Errorf("missing path %s", tc.path)
-			continue
-		}
-		wsOp, ok := pathItem["ws"].(map[string]any)
-		if !ok {
-			t.Errorf("missing ws operation at %s", tc.path)
-			continue
-		}
-		if wsOp["x-ws-message"] != tc.message {
-			t.Errorf("%s x-ws-message = %v; want %s", tc.path, wsOp["x-ws-message"], tc.message)
-		}
-		if wsOp["x-ws-endpoint"] != "/ws" {
-			t.Errorf("%s x-ws-endpoint = %v; want /ws", tc.path, wsOp["x-ws-endpoint"])
+	// Index commands by message name
+	byMessage := map[string]map[string]any{}
+	for _, c := range cmds {
+		cmd := c.(map[string]any)
+		if msg, _ := cmd["message"].(string); msg != "" {
+			byMessage[msg] = cmd
 		}
 	}
 
-	// Verify /ws/stop has required task_id param.
-	stopItem, _ := paths["/ws/stop"].(map[string]any)
-	stopOp, _ := stopItem["ws"].(map[string]any)
-	stopParams, _ := stopOp["parameters"].([]any)
+	expectedMessages := []string{
+		"list", "stop", "reset", "replay", "describe",
+		"pool_info", "purge", "set_pool", "subscribe",
+		"unsubscribe", "metrics", "manifest",
+	}
+	for _, msg := range expectedMessages {
+		if _, ok := byMessage[msg]; !ok {
+			t.Errorf("missing command with message=%q", msg)
+		}
+	}
+
+	// stop requires task_id (uuid)
+	stopCmd := byMessage["stop"]
+	stopParams, _ := stopCmd["parameters"].([]any)
 	if len(stopParams) != 1 {
-		t.Fatalf("/ws/stop expected 1 param, got %d", len(stopParams))
+		t.Fatalf("stop: expected 1 param, got %d", len(stopParams))
 	}
 	p0, _ := stopParams[0].(map[string]any)
-	if p0["name"] != "task_id" || p0["required"] != true {
-		t.Errorf("/ws/stop param = %v; want required task_id", p0)
+	if p0["name"] != "task_id" {
+		t.Errorf("stop param name = %v; want task_id", p0["name"])
 	}
-	if p0["x-ws-type"] != "uuid" {
-		t.Errorf("/ws/stop task_id x-ws-type = %v; want uuid", p0["x-ws-type"])
+	if p0["required"] != true {
+		t.Errorf("stop task_id required = %v; want true", p0["required"])
+	}
+	if p0["type"] != "uuid" {
+		t.Errorf("stop task_id type = %v; want uuid", p0["type"])
+	}
+
+	// manifest has no parameters
+	manifestCmd := byMessage["manifest"]
+	if manifestCmd["parameters"] != nil {
+		t.Errorf("manifest should have no parameters, got %v", manifestCmd["parameters"])
+	}
+
+	// set_pool has object-typed excess param
+	setPoolCmd := byMessage["set_pool"]
+	setPoolParams, _ := setPoolCmd["parameters"].([]any)
+	var excessParam map[string]any
+	for _, p := range setPoolParams {
+		pm := p.(map[string]any)
+		if pm["name"] == "excess" {
+			excessParam = pm
+			break
+		}
+	}
+	if excessParam == nil {
+		t.Fatal("set_pool: excess param not found")
+	}
+	if excessParam["type"] != "object" {
+		t.Errorf("set_pool excess type = %v; want object", excessParam["type"])
 	}
 }
