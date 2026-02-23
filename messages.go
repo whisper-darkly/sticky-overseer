@@ -35,15 +35,17 @@ const (
 // RetryPolicy controls automatic restarts.
 type RetryPolicy struct {
 	RestartDelay   time.Duration `json:"restart_delay,omitempty"`
+	RestartJitter  time.Duration `json:"restart_jitter,omitempty"` // max random jitter added to each delay (0 = disabled)
 	ErrorWindow    time.Duration `json:"error_window,omitempty"`
 	ErrorThreshold int           `json:"error_threshold,omitempty"`
 }
 
-// MarshalJSON serialises RestartDelay and ErrorWindow as human-readable
-// duration strings (e.g. "30s") rather than the default int64 nanoseconds.
+// MarshalJSON serialises duration fields as human-readable strings (e.g. "30s")
+// rather than the default int64 nanoseconds.
 func (r RetryPolicy) MarshalJSON() ([]byte, error) {
 	type raw struct {
 		RestartDelay   string `json:"restart_delay,omitempty"`
+		RestartJitter  string `json:"restart_jitter,omitempty"`
 		ErrorWindow    string `json:"error_window,omitempty"`
 		ErrorThreshold int    `json:"error_threshold,omitempty"`
 	}
@@ -51,16 +53,20 @@ func (r RetryPolicy) MarshalJSON() ([]byte, error) {
 	if r.RestartDelay != 0 {
 		v.RestartDelay = r.RestartDelay.String()
 	}
+	if r.RestartJitter != 0 {
+		v.RestartJitter = r.RestartJitter.String()
+	}
 	if r.ErrorWindow != 0 {
 		v.ErrorWindow = r.ErrorWindow.String()
 	}
 	return json.Marshal(v)
 }
 
-// UnmarshalYAML parses RestartDelay and ErrorWindow from duration strings in YAML.
+// UnmarshalYAML parses duration fields from duration strings in YAML.
 func (r *RetryPolicy) UnmarshalYAML(value *yaml.Node) error {
 	type raw struct {
 		RestartDelay   string `yaml:"restart_delay"`
+		RestartJitter  string `yaml:"restart_jitter"`
 		ErrorWindow    string `yaml:"error_window"`
 		ErrorThreshold int    `yaml:"error_threshold"`
 	}
@@ -69,29 +75,31 @@ func (r *RetryPolicy) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	r.ErrorThreshold = v.ErrorThreshold
-	if v.RestartDelay != "" {
-		d, err := time.ParseDuration(v.RestartDelay)
-		if err != nil {
-			return err
+	for _, pair := range []struct {
+		s string
+		d *time.Duration
+	}{
+		{v.RestartDelay, &r.RestartDelay},
+		{v.RestartJitter, &r.RestartJitter},
+		{v.ErrorWindow, &r.ErrorWindow},
+	} {
+		if pair.s != "" {
+			d, err := time.ParseDuration(pair.s)
+			if err != nil {
+				return err
+			}
+			*pair.d = d
 		}
-		r.RestartDelay = d
-	}
-	if v.ErrorWindow != "" {
-		d, err := time.ParseDuration(v.ErrorWindow)
-		if err != nil {
-			return err
-		}
-		r.ErrorWindow = d
 	}
 	return nil
 }
 
-// UnmarshalJSON parses RestartDelay and ErrorWindow from duration strings at
-// decode time, so a malformed value is caught immediately rather than silently
-// disabling the feature.
+// UnmarshalJSON parses duration fields from duration strings at decode time,
+// so a malformed value is caught immediately rather than silently disabling the feature.
 func (r *RetryPolicy) UnmarshalJSON(b []byte) error {
 	type raw struct {
 		RestartDelay   string `json:"restart_delay,omitempty"`
+		RestartJitter  string `json:"restart_jitter,omitempty"`
 		ErrorWindow    string `json:"error_window,omitempty"`
 		ErrorThreshold int    `json:"error_threshold,omitempty"`
 	}
@@ -100,19 +108,21 @@ func (r *RetryPolicy) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	r.ErrorThreshold = v.ErrorThreshold
-	if v.RestartDelay != "" {
-		d, err := time.ParseDuration(v.RestartDelay)
-		if err != nil {
-			return err
+	for _, pair := range []struct {
+		s string
+		d *time.Duration
+	}{
+		{v.RestartDelay, &r.RestartDelay},
+		{v.RestartJitter, &r.RestartJitter},
+		{v.ErrorWindow, &r.ErrorWindow},
+	} {
+		if pair.s != "" {
+			d, err := time.ParseDuration(pair.s)
+			if err != nil {
+				return err
+			}
+			*pair.d = d
 		}
-		r.RestartDelay = d
-	}
-	if v.ErrorWindow != "" {
-		d, err := time.ParseDuration(v.ErrorWindow)
-		if err != nil {
-			return err
-		}
-		r.ErrorWindow = d
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	"sort"
@@ -1113,8 +1114,11 @@ func (h *Hub) onWorkerExited(w *Worker, exitCode int, intentional bool, now time
 		return
 	}
 
-	restartDelay := rp.RestartDelay
 	attempt := task.record.RestartCount + 1
+	restartDelay := rp.RestartDelay
+	if rp.RestartJitter > 0 {
+		restartDelay += time.Duration(mrand.Int63n(int64(rp.RestartJitter)))
+	}
 	h.metrics.RecordRestart(w.TaskID, task.record.Action)
 	h.BroadcastToSubscribers(w.TaskID, RestartingMessage{
 		Type:         "restarting",
